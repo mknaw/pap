@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-pub mod parser;
+pub(crate) mod parser;
+pub(crate) mod utils;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -23,9 +24,12 @@ fn main() {
     match &cli.command {
         Commands::Disassemble { path } => match parser::disassemble(path) {
             Ok(instructions) => instructions.iter().for_each(|instr| println!("{}", instr)),
-            Err(e) => std::io::stderr()
-                .write_all(e.to_string().as_bytes())
-                .unwrap(),
+            Err(e) => {
+                std::io::stderr()
+                    .write_all(e.to_string().as_bytes())
+                    .unwrap();
+                std::process::exit(1);
+            }
         },
     }
 }

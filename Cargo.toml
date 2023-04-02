@@ -8,6 +8,9 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.70"
 clap = { version = "4.2.1", features = ["derive"] }
+itertools = "0.10.5"
 
 [dev-dependencies]
 assert_cmd = { version = "2.0.10", features = ["color-auto"] }
+itertools = "0.10.5"
+tempfile = "3.5.0"

@@ -1,6 +1,14 @@
 use std::fmt::Display;
 use std::path::PathBuf;
 
+use nom::bits::bits;
+use nom::bits::complete::{tag, take};
+use nom::branch::alt;
+use nom::bytes::complete::take as take_bytes;
+use nom::combinator::{iterator, map};
+use nom::sequence::tuple;
+use nom::IResult;
+
 use crate::utils::print_vec_u8_bits;
 
 pub enum MovDest {
@@ -17,15 +25,10 @@ impl Display for MovDest {
     }
 }
 
-pub enum Immediate {
-    Narrow(u8),
-    Wide(u16),
-}
-
 pub enum MovSrc {
     Reg(Register),
     Mem(MemAddr),
-    Imd(Immediate),
+    Imd(u16),
 }
 
 impl Display for MovSrc {
@@ -97,15 +100,6 @@ impl std::fmt::Display for MemAddr {
     }
 }
 
-impl std::fmt::Display for Immediate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Narrow(x) => write!(f, "{}", x),
-            Self::Wide(x) => write!(f, "{}", x),
-        }
-    }
-}
-
 fn parse_register(wide: bool, code: u8) -> Register {
     match code {
         0b000 => {
@@ -170,15 +164,11 @@ fn parse_register(wide: bool, code: u8) -> Register {
 
 pub fn disassemble(path: &PathBuf) -> anyhow::Result<Vec<Instr>> {
     let data = std::fs::read(path)?;
-    let mut input = data.as_slice();
-    let mut instructions = Vec::new();
-
-    while !input.is_empty() {
-        let (instruction, tail) = parse_instr(input)?;
-        instructions.push(instruction);
-        input = tail;
-    }
-    Ok(instructions)
+    let input = data.as_slice();
+    let mut it = iterator(input, parse_instr);
+    let instrs = it.collect::<Vec<Instr>>();
+    it.finish().unwrap();
+    Ok(instrs)
 }
 
 #[derive(Debug)]
@@ -191,8 +181,6 @@ impl std::fmt::Display for ParseError {
 }
 
 impl std::error::Error for ParseError {}
-
-type ParseResult<'a> = Result<(Instr, &'a [u8]), ParseError>;
 
 pub enum Displacement {
     D8,
@@ -216,62 +204,90 @@ impl From<u8> for MovMode {
     }
 }
 
-pub fn parse_instr(input: &[u8]) -> ParseResult {
-    let first = input.first().ok_or(ParseError(input.to_vec()))?;
-    if first >> 2 == 0b00100010 {
-        parse_mov(input)
-    } else if first >> 4 == 0b00001011 {
-        parse_mov_immediate(input)
-    } else {
-        Err(ParseError(input.to_vec()))
-    }
+/// Parse some instruction from the bits.
+fn parse_instr(input: &[u8]) -> IResult<&[u8], Instr> {
+    alt((parse_mov, parse_mov_immediate))(input)
 }
 
-fn parse_mov(input: &[u8]) -> ParseResult {
-    let (head, tail) = input.split_first().unwrap();
-    let wide = head & 0b01 > 0;
-    let destination = head & 0b10 > 0;
-    let (head, tail) = tail.split_first().ok_or(ParseError(input.to_vec()))?;
-    let reg = parse_register(wide, head >> 3 & 0b111);
-    let rm = head & 0b111;
-    let mode = (head >> 6).into();
-    let (dst, src, tail) = match &mode {
-        MovMode::MemMode(disp) => {
-            let (disp, tail) = match disp {
-                None => (0, tail),
-                Some(Displacement::D8) => {
-                    let (disp, tail) = tail.split_first().ok_or(ParseError(tail.to_vec()))?;
-                    (*disp as u16, tail)
-                }
-                Some(Displacement::D16) => {
-                    let (bottom, tail) = tail.split_first().ok_or(ParseError(tail.to_vec()))?;
-                    let (top, tail) = tail.split_first().ok_or(ParseError(tail.to_vec()))?;
-                    ((*top as u16) << 8 | (*bottom as u16), tail)
-                }
-            };
+/// Parse register/memory/immediate to/from register/memory instructions.
+fn parse_mov(input: &[u8]) -> IResult<&[u8], Instr> {
+    // First byte
+    let (input, (_, destination, wide)): (&[u8], (u8, bool, bool)) =
+        bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(tuple((
+            tag(0b100010, 6usize),
+            map(take(1usize), |x: u8| x == 1),
+            map(take(1usize), |x: u8| x == 1),
+        )))(input)?;
 
-            let mem_addr = parse_effective_address(mode, rm, disp);
+    // Second byte
+    let (input, (mode, reg, rm)): (&[u8], (MovMode, Register, u8)) =
+        bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(tuple((
+            map(take(2usize), |code: u8| code.into()),
+            map(take(3usize), |code: u8| parse_register(wide, code)),
+            take(3usize),
+        )))(input)?;
+
+    let (input, dst, src) = match &mode {
+        MovMode::MemMode(disp) => {
+            let (input, disp) = match disp {
+                None => (input, 0),
+                Some(Displacement::D8) => parse_imd_narrow(input)?,
+                Some(Displacement::D16) => parse_imd_wide(input)?,
+            };
+            let mem_addr = parse_effective_address(&mode, rm, disp);
             if destination {
-                (MovDest::Reg(reg), MovSrc::Mem(mem_addr), tail)
+                (input, MovDest::Reg(reg), MovSrc::Mem(mem_addr))
             } else {
-                (MovDest::Mem(mem_addr), MovSrc::Reg(reg), tail)
+                (input, MovDest::Mem(mem_addr), MovSrc::Reg(reg))
             }
         }
         MovMode::RegMode => {
             let rm = parse_register(wide, rm);
             if destination {
-                (MovDest::Reg(reg), MovSrc::Reg(rm), tail)
+                (input, MovDest::Reg(reg), MovSrc::Reg(rm))
             } else {
-                (MovDest::Reg(rm), MovSrc::Reg(reg), tail)
+                (input, MovDest::Reg(rm), MovSrc::Reg(reg))
             }
         }
     };
 
-    let instr = Instr::Mov { dst, src };
-    Ok((instr, tail))
+    Ok((input, Instr::Mov { dst, src }))
 }
 
-fn parse_effective_address(mode: MovMode, code: u8, disp: u16) -> MemAddr {
+/// Parse immediate to register instructions.
+fn parse_mov_immediate(input: &[u8]) -> IResult<&[u8], Instr> {
+    let (input, (_, wide, reg)): (&[u8], (u8, bool, u8)) =
+        bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(tuple((
+            tag(0b1011, 4usize),
+            map(take(1usize), |x: u8| x == 1),
+            take(3usize),
+        )))(input)?;
+
+    let (input, imd) = if wide {
+        parse_imd_wide(input)?
+    } else {
+        parse_imd_narrow(input)?
+    };
+    let instr = Instr::Mov {
+        dst: MovDest::Reg(parse_register(wide, reg)),
+        src: MovSrc::Imd(imd),
+    };
+    Ok((input, instr))
+}
+
+/// Parse the single next byte as a "literal."
+fn parse_imd_narrow(input: &[u8]) -> IResult<&[u8], u16> {
+    map(take_bytes(1usize), |x: &[u8]| x[0] as u16)(input)
+}
+
+/// Parse the next two bytes as a "literal."
+fn parse_imd_wide(input: &[u8]) -> IResult<&[u8], u16> {
+    map(take_bytes(2usize), |x: &[u8]| {
+        (x[1] as u16) << 8 | (x[0] as u16)
+    })(input)
+}
+
+fn parse_effective_address(mode: &MovMode, code: u8, disp: u16) -> MemAddr {
     let (reg1, reg2) = match code {
         0b000 => (Some(Register::BX), Some(Register::SI)),
         0b001 => (Some(Register::BX), Some(Register::DI)),
@@ -288,27 +304,4 @@ fn parse_effective_address(mode: MovMode, code: u8, disp: u16) -> MemAddr {
         _ => panic!("invalid input code"),
     };
     MemAddr { reg1, reg2, disp }
-}
-
-fn parse_mov_immediate(input: &[u8]) -> ParseResult {
-    let (first, tail) = input.split_first().unwrap();
-    let wide = first & 0b00001000 > 0;
-    let reg = parse_register(wide, first & 0b111);
-    let (second, tail) = tail.split_first().ok_or(ParseError(input.to_vec()))?;
-    if wide {
-        let (third, tail) = tail.split_first().ok_or(ParseError(input.to_vec()))?;
-        let immediate = Immediate::Wide((*third as u16) << 8 | (*second as u16));
-        let instr = Instr::Mov {
-            dst: MovDest::Reg(reg),
-            src: MovSrc::Imd(immediate),
-        };
-        Ok((instr, tail))
-    } else {
-        let immediate = Immediate::Narrow(*second);
-        let instr = Instr::Mov {
-            dst: MovDest::Reg(reg),
-            src: MovSrc::Imd(immediate),
-        };
-        Ok((instr, tail))
-    }
 }

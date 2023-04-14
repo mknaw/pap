@@ -6,8 +6,8 @@ pub fn print_u8_bits(x: &u8) -> String {
     })
 }
 
-pub fn print_vec_u8_bits(v: &Vec<u8>) -> String {
-    v.into_iter()
+pub fn print_vec_u8_bits(v: &[u8]) -> String {
+    v.iter()
         .chunks(4)
         .into_iter()
         .map(|chunk| chunk.map(print_u8_bits).collect::<Vec<_>>().join(" "))

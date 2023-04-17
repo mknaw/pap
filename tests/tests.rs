@@ -46,6 +46,10 @@ fn test_disassemble_listing_38() {
 
 #[test]
 fn test_disassemble_listing_39() {
-    // TODO
     test_disassemble("./assets/listing_39");
+}
+
+#[test]
+fn test_disassemble_listing_40() {
+    test_disassemble("./assets/listing_40");
 }

@@ -53,3 +53,13 @@ fn test_disassemble_listing_39() {
 fn test_disassemble_listing_40() {
     test_disassemble("./assets/listing_40");
 }
+
+#[test]
+fn test_disassemble_listing_41() {
+    test_disassemble("./assets/listing_41");
+}
+
+#[test]
+fn test_disassemble_listing_42() {
+    test_disassemble("./assets/listing_42");
+}

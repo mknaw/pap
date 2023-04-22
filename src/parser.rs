@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use nom::bits::bits;
 use nom::bits::complete::{tag, take};
 use nom::branch::alt;
-use nom::bytes::complete::take as take_bytes;
+use nom::bytes::complete::{tag as tag_bytes, take as take_bytes};
 use nom::combinator::{iterator, map};
 use nom::sequence::tuple;
 use nom::IResult;
@@ -24,50 +24,112 @@ impl Display for RM {
             RM::Reg(reg) => write!(f, "{}", reg),
             RM::Mem(ea) => write!(f, "{}", ea),
             RM::Imd(imd) => match imd {
-                Literal::Narrow(x) => write!(f, "byte {}", x),
-                Literal::Wide(x) => write!(f, "word {}", x),
+                Literal::Byte(x) => write!(f, "byte {}", x),
+                Literal::Word(x) => write!(f, "word {}", x),
             },
         }
     }
 }
 
-pub enum MovDest {
+pub enum Dest {
     Reg(Register),
     Mem(MemAddr),
 }
 
-impl Display for MovDest {
+impl Display for Dest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MovDest::Reg(reg) => write!(f, "{}", reg),
-            MovDest::Mem(ea) => write!(f, "{}", ea),
+            Dest::Reg(reg) => write!(f, "{}", reg),
+            Dest::Mem(ea) => write!(f, "{}", ea),
         }
     }
 }
 
-impl TryFrom<RM> for MovDest {
+impl TryFrom<RM> for Dest {
     type Error = String;
 
     fn try_from(value: RM) -> Result<Self, Self::Error> {
         match value {
-            RM::Reg(register) => Ok(MovDest::Reg(register)),
-            RM::Mem(memaddr) => Ok(MovDest::Mem(memaddr)),
+            RM::Reg(register) => Ok(Dest::Reg(register)),
+            RM::Mem(memaddr) => Ok(Dest::Mem(memaddr)),
             RM::Imd(_) => Err("Cannot convert `Imd` variant to `MovDest`.".to_string()),
         }
     }
 }
 
+#[derive(strum_macros::Display)]
+#[strum(serialize_all = "lowercase")]
+pub enum BinaryOp {
+    Mov,
+    Add,
+    Sub,
+    Cmp,
+}
+
+#[derive(strum_macros::Display)]
+#[strum(serialize_all = "lowercase")]
+pub enum JumpOp {
+    Jnz,
+    Je,
+    Jl,
+    Jle,
+    Jb,
+    Jbe,
+    Jp,
+    Jo,
+    Js,
+    Jnl,
+    Jg,
+    Jnb,
+    Ja,
+    Jnp,
+    Jno,
+    Jns,
+    Loop,
+    Loopz,
+    Loopnz,
+    Jcxz,
+}
+
 pub enum Instr {
-    Mov { dst: MovDest, src: RM },
+    BinaryInstr { op: BinaryOp, dst: Dest, src: RM },
+    JumpInstr { op: JumpOp, inc: Incr },
 }
 
 impl Display for Instr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Instr::Mov { dst, src } => {
-                write!(f, "mov {}, {}", dst, src)
+            Instr::BinaryInstr { op, dst, src } => {
+                write!(f, "{} {}, {}", op, dst, src)
+            }
+            Instr::JumpInstr { op, inc } => {
+                write!(f, "{} {}", op, inc)
             }
         }
+    }
+}
+
+// TODO could be less sloppy with this
+fn join_display_vec(items: Vec<Instr>) -> String {
+    let mut result = String::new();
+
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            result.push('\n');
+        }
+        result.push_str(&format!("{}", item));
+    }
+
+    result
+}
+
+pub struct Incr(i8);
+
+impl Display for Incr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let sign = if self.0 < 0 { "-" } else { "+" };
+        let inc = (self.0 + 2).abs();
+        write!(f, "${}{}", sign, inc)
     }
 }
 
@@ -98,15 +160,24 @@ impl Display for Register {
 }
 
 pub enum Literal {
-    Narrow(i8),
-    Wide(u16),
+    Byte(i8),
+    Word(u16),
+}
+
+impl Literal {
+    pub fn as_word(self) -> Self {
+        match self {
+            Self::Byte(x) => Self::Word(x as u16),
+            Self::Word(x) => Self::Word(x),
+        }
+    }
 }
 
 impl Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Narrow(x) => write!(f, "{}", x),
-            Self::Wide(x) => write!(f, "{}", x),
+            Self::Byte(x) => write!(f, "{}", x),
+            Self::Word(x) => write!(f, "{}", x),
         }
     }
 }
@@ -144,7 +215,7 @@ impl Display for MemAddr {
         }
 
         if let Some(val) = self.disp.as_ref() {
-            let is_neg = matches!(val, Literal::Narrow(x) if *x < 0);
+            let is_neg = matches!(val, Literal::Byte(x) if *x < 0);
             let connector = match (is_first, is_neg) {
                 (true, true) => "-",
                 (true, false) => "",
@@ -152,8 +223,10 @@ impl Display for MemAddr {
                 (false, false) => " + ",
             };
             match val {
-                Literal::Narrow(x) => write!(f, "{}{}", connector, x.abs())?,
-                Literal::Wide(x) => write!(f, "{}{}", connector, x)?,
+                //Literal::Narrow(0) => (),
+                //Literal::Wide(0) => (),
+                Literal::Byte(x) => write!(f, "{}{}", connector, x.abs())?,
+                Literal::Word(x) => write!(f, "{}{}", connector, x)?,
             }
         };
 
@@ -229,7 +302,12 @@ pub fn disassemble(path: &PathBuf) -> anyhow::Result<Vec<Instr>> {
     let mut it = iterator(input, parse_instr);
     let instrs = it.collect::<Vec<Instr>>();
     let (rest, _) = it.finish().unwrap();
-    assert!(rest.is_empty(), "Did not parse whole input!");
+    // TODO really should be a Result, not this panic.
+    assert!(
+        rest.is_empty(),
+        "Did not parse whole input!\n{}",
+        join_display_vec(instrs)
+    );
     Ok(instrs)
 }
 
@@ -269,20 +347,55 @@ impl From<u8> for MovMode {
 /// Parse some instruction from the bits.
 fn parse_instr(input: &[u8]) -> IResult<&[u8], Instr> {
     alt((
-        parse_mov,
-        parse_mov_immediate,
-        parse_mov_immediate_to_reg_or_mem,
-        parse_mov_mem_to_accum,
-        parse_mov_accum_to_mem,
+        alt((
+            parse_mov_imd_to_reg,
+            move |input| parse_rm_to_rm(input, 0b100010, BinaryOp::Mov),
+            move |input| parse_rm_to_rm(input, 0b000000, BinaryOp::Add),
+            move |input| parse_rm_to_rm(input, 0b001010, BinaryOp::Sub),
+            move |input| parse_rm_to_rm(input, 0b001110, BinaryOp::Cmp),
+            move |input| parse_imd_to_rm(input, 0b110001, 0b000, true, BinaryOp::Mov),
+            move |input| parse_imd_to_rm(input, 0b100000, 0b000, false, BinaryOp::Add),
+            move |input| parse_imd_to_rm(input, 0b100000, 0b101, false, BinaryOp::Sub),
+            move |input| parse_imd_to_rm(input, 0b100000, 0b111, false, BinaryOp::Cmp),
+            // TODO do I really need 2 of these for `Mov`? maybe can just get it from the last bit.
+            move |input| parse_accum_style(input, 0b1010000, true, BinaryOp::Mov),
+            move |input| parse_accum_style(input, 0b1010001, false, BinaryOp::Mov),
+            move |input| parse_accum_style(input, 0b0000010, true, BinaryOp::Add),
+            move |input| parse_accum_style(input, 0b0010110, true, BinaryOp::Sub),
+            move |input| parse_accum_style(input, 0b0011110, true, BinaryOp::Cmp),
+        )),
+        // `JumpInstr`s
+        alt((
+            |input| parse_jump_instr(input, 0b01110000, JumpOp::Jo),
+            |input| parse_jump_instr(input, 0b01110001, JumpOp::Jno),
+            |input| parse_jump_instr(input, 0b01110010, JumpOp::Jb),
+            |input| parse_jump_instr(input, 0b01110011, JumpOp::Jnb),
+            |input| parse_jump_instr(input, 0b01110100, JumpOp::Je),
+            |input| parse_jump_instr(input, 0b01110101, JumpOp::Jnz),
+            |input| parse_jump_instr(input, 0b01110110, JumpOp::Jbe),
+            |input| parse_jump_instr(input, 0b01110111, JumpOp::Ja),
+            |input| parse_jump_instr(input, 0b01111000, JumpOp::Js),
+            |input| parse_jump_instr(input, 0b01111001, JumpOp::Jns),
+            |input| parse_jump_instr(input, 0b01111010, JumpOp::Jp),
+            |input| parse_jump_instr(input, 0b01111011, JumpOp::Jnp),
+            |input| parse_jump_instr(input, 0b01111100, JumpOp::Jl),
+            |input| parse_jump_instr(input, 0b01111101, JumpOp::Jnl),
+            |input| parse_jump_instr(input, 0b01111110, JumpOp::Jle),
+            |input| parse_jump_instr(input, 0b01111111, JumpOp::Jg),
+            |input| parse_jump_instr(input, 0b11100000, JumpOp::Loopnz),
+            |input| parse_jump_instr(input, 0b11100001, JumpOp::Loopz),
+            |input| parse_jump_instr(input, 0b11100010, JumpOp::Loop),
+            |input| parse_jump_instr(input, 0b11100011, JumpOp::Jcxz),
+        )),
     ))(input)
 }
 
 /// Parse register/memory/immediate to/from register/memory instructions.
-fn parse_mov(input: &[u8]) -> IResult<&[u8], Instr> {
+fn parse_rm_to_rm(input: &[u8], flag: u8, op: BinaryOp) -> IResult<&[u8], Instr> {
     // First byte
     let (input, (_, destination, wide)): (&[u8], (u8, bool, bool)) =
         bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(tuple((
-            tag(0b100010, 6usize),
+            tag(flag, 6usize),
             map(take(1usize), |x: u8| x == 1),
             map(take(1usize), |x: u8| x == 1),
         )))(input)?;
@@ -296,22 +409,29 @@ fn parse_mov(input: &[u8]) -> IResult<&[u8], Instr> {
         )))(input)?;
 
     let (input, rm) = parse_rm(input, &mode, wide, rm)?;
-    let instr = if destination {
-        Instr::Mov {
-            dst: MovDest::Reg(reg),
-            src: rm,
-        }
+    if destination {
+        Ok((
+            input,
+            Instr::BinaryInstr {
+                op,
+                dst: Dest::Reg(reg),
+                src: rm,
+            },
+        ))
     } else {
-        Instr::Mov {
-            dst: rm.try_into().unwrap(),
-            src: RM::Reg(reg),
-        }
-    };
-    Ok((input, instr))
+        Ok((
+            input,
+            Instr::BinaryInstr {
+                op,
+                dst: rm.try_into().unwrap(),
+                src: RM::Reg(reg),
+            },
+        ))
+    }
 }
 
 /// Parse immediate to register instructions.
-fn parse_mov_immediate(input: &[u8]) -> IResult<&[u8], Instr> {
+fn parse_mov_imd_to_reg(input: &[u8]) -> IResult<&[u8], Instr> {
     let (input, (_, wide, reg)): (&[u8], (u8, bool, u8)) =
         bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(tuple((
             tag(0b1011, 4usize),
@@ -320,22 +440,30 @@ fn parse_mov_immediate(input: &[u8]) -> IResult<&[u8], Instr> {
         )))(input)?;
 
     let (input, imd) = if wide {
-        parse_literal_wide(input)?
+        parse_literal_word(input)?
     } else {
-        parse_literal_narrow(input)?
+        parse_literal_byte(input)?
     };
-    let instr = Instr::Mov {
-        dst: MovDest::Reg(parse_register(wide, reg)),
+    let instr = Instr::BinaryInstr {
+        op: BinaryOp::Mov,
+        dst: Dest::Reg(parse_register(wide, reg)),
         src: RM::Imd(imd),
     };
     Ok((input, instr))
 }
 
-fn parse_mov_immediate_to_reg_or_mem(input: &[u8]) -> IResult<&[u8], Instr> {
+fn parse_imd_to_rm(
+    input: &[u8],
+    opcode1: u8,
+    opcode2: u8,
+    ignore_s: bool, // TODO maybe just need to check if op is MOV?
+    op: BinaryOp,
+) -> IResult<&[u8], Instr> {
     // First byte
-    let (input, (_, wide)): (&[u8], (u8, bool)) =
+    let (input, (_, s, w)): (&[u8], (u8, bool, bool)) =
         bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(tuple((
-            tag(0b1100011, 7usize),
+            tag(opcode1, 6usize),
+            map(take(1usize), |x: u8| x == 1),
             map(take(1usize), |x: u8| x == 1),
         )))(input)?;
 
@@ -343,29 +471,40 @@ fn parse_mov_immediate_to_reg_or_mem(input: &[u8]) -> IResult<&[u8], Instr> {
     let (input, (mode, _, rm)): (&[u8], (MovMode, u8, u8)) =
         bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(tuple((
             map(take(2usize), |code: u8| code.into()),
-            tag(0b000, 3usize),
+            tag(opcode2, 3usize),
             take(3usize),
         )))(input)?;
 
-    let (input, rm) = parse_rm(input, &mode, wide, rm)?;
+    let (input, rm) = parse_rm(input, &mode, w, rm)?;
 
-    let (input, data) = if wide {
-        let (input, literal) = parse_literal_wide(input)?;
+    let (input, data) = if w && (ignore_s || !s) {
+        let (input, literal) = parse_literal_word(input)?;
         (input, literal)
     } else {
-        let (input, literal) = parse_literal_narrow(input)?;
+        let (input, mut literal) = parse_literal_byte(input)?;
+        if w {
+            literal = literal.as_word();
+        }
         (input, literal)
     };
 
-    let instr = Instr::Mov {
-        dst: rm.try_into().unwrap(),
-        src: RM::Imd(data),
-    };
-    Ok((input, instr))
+    Ok((
+        input,
+        Instr::BinaryInstr {
+            op,
+            dst: rm.try_into().unwrap(),
+            src: RM::Imd(data),
+        },
+    ))
 }
 
 /// Helper for extracting similar accumulator-style MOVs.
-fn parse_accum_style_mov(input: &[u8], code: u8) -> IResult<&[u8], Literal> {
+fn parse_accum_style(
+    input: &[u8],
+    code: u8,
+    destination: bool,
+    op: BinaryOp,
+) -> IResult<&[u8], Instr> {
     // First byte
     let (input, (_, wide)): (&[u8], (u8, bool)) =
         bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(tuple((
@@ -373,44 +512,49 @@ fn parse_accum_style_mov(input: &[u8], code: u8) -> IResult<&[u8], Literal> {
             map(take(1usize), |x: u8| x == 1),
         )))(input)?;
 
-    if wide {
-        parse_literal_wide(input)
+    let (input, data) = if wide {
+        parse_literal_word(input)?
     } else {
-        parse_literal_narrow(input)
+        parse_literal_byte(input)?
+    };
+    let reg = if wide { Register::AX } else { Register::AL };
+    match (destination, &op) {
+        (true, BinaryOp::Mov) => Ok((
+            input,
+            Instr::BinaryInstr {
+                op,
+                dst: Dest::Reg(reg),
+                src: RM::Mem(MemAddr::new(None, None, Some(data))),
+            },
+        )),
+        (false, BinaryOp::Mov) => Ok((
+            input,
+            Instr::BinaryInstr {
+                op,
+                dst: Dest::Mem(MemAddr::new(None, None, Some(data))),
+                src: RM::Reg(reg),
+            },
+        )),
+        _ => Ok((
+            input,
+            Instr::BinaryInstr {
+                op,
+                dst: Dest::Reg(reg),
+                src: RM::Imd(data),
+            },
+        )),
     }
 }
 
-/// Parse memory to accumulator instructions.
-fn parse_mov_mem_to_accum(input: &[u8]) -> IResult<&[u8], Instr> {
-    let (input, data) = parse_accum_style_mov(input, 0b1010000)?;
-    let mem_addr = MemAddr::new(None, None, Some(data));
-    let instr = Instr::Mov {
-        dst: MovDest::Reg(Register::AX),
-        src: RM::Mem(mem_addr),
-    };
-    Ok((input, instr))
-}
-
-/// Parse accumulator to memory instructions.
-fn parse_mov_accum_to_mem(input: &[u8]) -> IResult<&[u8], Instr> {
-    let (input, data) = parse_accum_style_mov(input, 0b1010001)?;
-    let mem_addr = MemAddr::new(None, None, Some(data));
-    let instr = Instr::Mov {
-        dst: MovDest::Mem(mem_addr),
-        src: RM::Reg(Register::AX),
-    };
-    Ok((input, instr))
-}
-
 /// Parse the single next byte as a "literal."
-fn parse_literal_narrow(input: &[u8]) -> IResult<&[u8], Literal> {
-    map(take_bytes(1usize), |x: &[u8]| Literal::Narrow(x[0] as i8))(input)
+fn parse_literal_byte(input: &[u8]) -> IResult<&[u8], Literal> {
+    map(take_bytes(1usize), |x: &[u8]| Literal::Byte(x[0] as i8))(input)
 }
 
 /// Parse the next two bytes as a "literal."
-fn parse_literal_wide(input: &[u8]) -> IResult<&[u8], Literal> {
+fn parse_literal_word(input: &[u8]) -> IResult<&[u8], Literal> {
     map(take_bytes(2usize), |x: &[u8]| {
-        Literal::Wide((x[1] as u16) << 8 | (x[0] as u16))
+        Literal::Word((x[1] as u16) << 8 | (x[0] as u16))
     })(input)
 }
 
@@ -442,18 +586,18 @@ fn parse_rm<'a, 'b>(
             let (input, disp) = match disp {
                 None => {
                     if rm == 0b110 {
-                        let (input, literal) = parse_literal_wide(input)?;
+                        let (input, literal) = parse_literal_word(input)?;
                         (input, Some(literal))
                     } else {
                         (input, None)
                     }
                 }
                 Some(Displacement::D8) => {
-                    let (input, literal) = parse_literal_narrow(input)?;
+                    let (input, literal) = parse_literal_byte(input)?;
                     (input, Some(literal))
                 }
                 Some(Displacement::D16) => {
-                    let (input, literal) = parse_literal_wide(input)?;
+                    let (input, literal) = parse_literal_word(input)?;
                     (input, Some(literal))
                 }
             };
@@ -465,4 +609,16 @@ fn parse_rm<'a, 'b>(
             Ok((input, RM::Reg(register)))
         }
     }
+}
+
+fn parse_jump_instr(input: &[u8], opcode: u8, op: JumpOp) -> IResult<&[u8], Instr> {
+    let (input, _) = tag_bytes([opcode])(input)?;
+    let (input, inc) = take_bytes(1usize)(input)?;
+    Ok((
+        input,
+        Instr::JumpInstr {
+            op,
+            inc: Incr(inc[0] as i8),
+        },
+    ))
 }

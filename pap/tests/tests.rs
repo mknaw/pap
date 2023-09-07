@@ -1,27 +1,24 @@
 use std::fs::File;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::Command;
 
-use assert_cmd::Command as AssertCommand;
 use tempfile::tempdir;
+
+use pap::disassemble;
 
 // Running these tests requires available `nasm` command!
 fn test_disassemble(target: &str) {
     let dir = tempdir().unwrap();
+    let path = PathBuf::from(target);
 
-    let disassembled = AssertCommand::cargo_bin("pap")
-        .unwrap()
-        .arg("disassemble")
-        .arg(target)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
+    let disassembled = disassemble(&path).unwrap();
 
     let disassembled_path = dir.path().join("instructions.asm");
     let mut disassembled_file = File::create(&disassembled_path).unwrap();
-    disassembled_file.write_all(&disassembled).unwrap();
+    disassembled.iter().for_each(|instr| {
+        writeln!(disassembled_file, "{}", instr).unwrap();
+    });
 
     let status = Command::new("nasm")
         .arg(&disassembled_path)
@@ -62,4 +59,9 @@ fn test_disassemble_listing_41() {
 #[test]
 fn test_disassemble_listing_42() {
     test_disassemble("./assets/listing_42");
+}
+
+#[test]
+fn test_disassemble_listing_43() {
+    test_disassemble("./assets/listing_43");
 }

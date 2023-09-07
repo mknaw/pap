@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::{self, Display};
 use std::path::PathBuf;
 
@@ -9,491 +10,80 @@ use nom::combinator::{iterator, map, opt};
 use nom::sequence::tuple;
 use nom::IResult;
 
+use crate::common::*;
 use crate::utils::print_vec_u8_bits;
 
-pub enum RM {
-    Reg(Register),
-    Mem(MemAddr),
-    Imd(Literal),
-    SegReg(Segment),
+// Common lookup tables.
+lazy_static! {
+    static ref CODE_TO_REGISTER: HashMap<u8, Register> = HashMap::from([
+        (0b000, Register::AL),
+        (0b001, Register::CL),
+        (0b010, Register::DL),
+        (0b011, Register::BL),
+        (0b100, Register::AH),
+        (0b101, Register::CH),
+        (0b110, Register::DH),
+        (0b111, Register::BH),
+    ]);
+    static ref CODE_TO_REGISTER_WIDE: HashMap<u8, Register> = HashMap::from([
+        (0b000, Register::AX),
+        (0b001, Register::CX),
+        (0b010, Register::DX),
+        (0b011, Register::BX),
+        (0b100, Register::SP),
+        (0b101, Register::BP),
+        (0b110, Register::SI),
+        (0b111, Register::DI),
+    ]);
+    static ref CODE_TO_SEGMENT: HashMap<u8, Segment> = HashMap::from([
+        (0b00, Segment::ES),
+        (0b01, Segment::CS),
+        (0b10, Segment::SS),
+        (0b11, Segment::DS),
+    ]);
 }
 
-impl Display for RM {
+#[derive(Debug)]
+pub struct ParseError(Vec<u8>);
+
+impl Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Reg(reg) => reg.fmt(f),
-            Self::Mem(ea) => ea.fmt(f),
-            Self::Imd(imd) => match imd {
-                Literal::Byte(x) => write!(f, "byte {}", x),
-                Literal::Word(x) => write!(f, "word {}", x),
-            },
-            Self::SegReg(sg) => sg.fmt(f),
-        }
+        write!(f, "Parse error @ {}", print_vec_u8_bits(&self.0))
     }
 }
 
-pub enum UnaryDest {
-    RM(RM),
-    InterSeg((Literal, Literal)),
-    Offset(Offset),
-}
+impl std::error::Error for ParseError {}
 
-impl Display for UnaryDest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RM(rm) => rm.fmt(f),
-            Self::InterSeg((start, end)) => write!(f, "{}:{}", start, end),
-            Self::Offset(offset) => offset.fmt(f),
-        }
-    }
-}
-
-pub enum ShiftRotSrc {
-    RM(RM),
-    One,
-}
-
-impl Display for ShiftRotSrc {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RM(rm) => rm.fmt(f),
-            Self::One => write!(f, "1"),
-        }
-    }
-}
-
-#[derive(strum_macros::Display)]
-#[strum(serialize_all = "lowercase")]
-pub enum NullaryOp {
-    Xlat,
-    Lahf,
-    Sahf,
-    Pushf,
-    Popf,
-    Aaa,
-    Daa,
-    Aas,
-    Das,
-    Aam,
-    Aad,
-    Cbw,
-    Cwd,
-    Movsb,
-    Cmpsb,
-    Scasb,
-    Lodsb,
-    Movsw,
-    Cmpsw,
-    Scasw,
-    Lodsw,
-    Stosb,
-    Stosw,
-    Int3,
-    Into,
-    Iret,
-    Clc,
-    Cmc,
-    Stc,
-    Cld,
-    Std,
-    Cli,
-    Sti,
-    Hlt,
-    Wait,
-}
-
-#[derive(strum_macros::Display)]
-#[strum(serialize_all = "lowercase")]
-pub enum UnaryOp {
-    Push,
-    Pop,
-    Inc,
-    Dec,
-    Neg,
-    Mul,
-    Imul,
-    Div,
-    Idiv,
-    Not,
-    Call,
-    #[strum(serialize = "call far")]
-    Callf,
-    Jmp,
-    #[strum(serialize = "jmp far")]
-    Jmpf,
-}
-
-#[derive(strum_macros::Display)]
-#[strum(serialize_all = "lowercase")]
-pub enum BinaryOp {
-    Mov,
-    Add,
-    Sub,
-    Cmp,
-    Xchg,
-    In,
-    Out,
-    Lea,
-    Lds,
-    Les,
-    Adc,
-    Sbb,
-    And,
-    Test,
-    Or,
-    Xor,
-}
-
-#[derive(strum_macros::Display)]
-#[strum(serialize_all = "lowercase")]
-pub enum ShiftRotOp {
-    Shl,
-    Shr,
-    Sar,
-    Rol,
-    Ror,
-    Rcl,
-    Rcr,
-}
-
-#[derive(strum_macros::Display)]
-#[strum(serialize_all = "lowercase")]
-pub enum JumpOp {
-    Jnz,
-    Je,
-    Jl,
-    Jle,
-    Jb,
-    Jbe,
-    Jp,
-    Jo,
-    Js,
-    Jnl,
-    Jg,
-    Jnb,
-    Ja,
-    Jnp,
-    Jno,
-    Jns,
-    Loop,
-    Loopz,
-    Loopnz,
-    Jcxz,
-}
-
-#[derive(strum_macros::Display)]
-#[strum(serialize_all = "lowercase")]
-pub enum ModifierOp {
-    Rep,
-    Lock,
-}
-
-#[derive(strum_macros::Display)]
-#[strum(serialize_all = "lowercase")]
-pub enum ControlXferOp {
-    Ret,
-    Retf,
-    Int,
-}
-
-pub enum Instr {
-    NullaryInstr {
-        op: NullaryOp,
-    },
-    UnaryInstr {
-        op: UnaryOp,
-        dst: UnaryDest,
-        wide: Option<bool>,
-    },
-    BinaryInstr {
-        op: BinaryOp,
-        dst: RM,
-        src: RM,
-    },
-    ShiftRotInstr {
-        op: ShiftRotOp,
-        dst: RM,
-        src: ShiftRotSrc,
-        wide: bool,
-    },
-    JumpInstr {
-        op: JumpOp,
-        offset: Offset,
-    },
-    ModifierInstr {
-        op: ModifierOp,
-        instr: Box<Instr>,
-    },
-    ControlXferInstr {
-        op: ControlXferOp,
-        value: Option<Literal>,
-    },
-}
-
-impl Display for Instr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Instr::NullaryInstr { op } => {
-                write!(f, "{}", op)
-            }
-            Instr::UnaryInstr { op, dst, wide } => match wide {
-                Some(true) => write!(f, "{} word {}", op, dst),
-                Some(false) => write!(f, "{} byte {}", op, dst),
-                _ => write!(f, "{} {}", op, dst),
-            },
-            Instr::BinaryInstr { op, dst, src } => {
-                write!(f, "{} {}, {}", op, dst, src)
-            }
-            Instr::ShiftRotInstr { op, dst, src, wide } => {
-                if *wide {
-                    write!(f, "{} word {}, {}", op, dst, src)
-                } else {
-                    write!(f, "{} byte {}, {}", op, dst, src)
-                }
-            }
-            Instr::JumpInstr { op, offset: inc } => {
-                write!(f, "{} {}", op, inc)
-            }
-            Instr::ModifierInstr { op, instr } => {
-                write!(f, "{} {}", op, instr)
-            }
-            Instr::ControlXferInstr { op, value } => {
-                if let Some(value) = value {
-                    write!(f, "{} {}", op, value)
-                } else {
-                    write!(f, "{}", op)
-                }
-            }
-        }
-    }
-}
-
-// TODO could be less sloppy with this
-fn join_display_vec(items: Vec<Instr>) -> String {
-    let mut result = String::new();
-
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 {
-            result.push('\n');
-        }
-        result.push_str(&format!("{}", item));
-    }
-
-    result
-}
-
-pub enum Offset {
-    Byte(i8),
-    Word(i16),
-}
-
-impl Display for Offset {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let val = match self {
-            Offset::Byte(val) => *val as i16,
-            Offset::Word(val) => *val,
-        };
-        let sign = if val < 0 { "-" } else { "+" };
-        let inc = (val + 2).abs();
-        write!(f, "${}{}", sign, inc)
-    }
-}
-
-#[derive(strum_macros::Display)]
-#[strum(serialize_all = "lowercase")]
-pub enum Register {
-    AL,
-    AX,
-    CL,
-    CX,
-    DL,
-    DX,
-    BL,
-    BX,
-    AH,
-    SP,
-    CH,
-    BP,
-    DH,
-    SI,
-    BH,
-    DI,
-}
-
-#[derive(strum_macros::Display)]
-#[strum(serialize_all = "lowercase")]
-pub enum Segment {
-    CS,
-    DS,
-    ES,
-    SS,
-}
-
-pub enum Literal {
-    Byte(i8),
-    Word(u16),
-}
-
-impl Literal {
-    pub fn as_word(self) -> Self {
-        match self {
-            Self::Byte(x) => Self::Word(x as u16),
-            Self::Word(x) => Self::Word(x),
-        }
-    }
-}
-
-impl Display for Literal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Byte(x) => write!(f, "{}", x),
-            Self::Word(x) => write!(f, "{}", x),
-        }
-    }
-}
-
-pub struct MemAddr {
-    segment: Option<Segment>,
-    reg1: Option<Register>,
-    reg2: Option<Register>,
-    disp: Option<Literal>,
-}
-
-impl MemAddr {
-    pub fn new(
-        segment: Option<Segment>,
-        reg1: Option<Register>,
-        reg2: Option<Register>,
-        disp: Option<Literal>,
-    ) -> Self {
-        if reg1.is_none() && reg2.is_none() && disp.is_none() {
-            panic!("Have to have at least one Some for MemAddr attributes.");
-        }
-        Self {
-            segment,
-            reg1,
-            reg2,
-            disp,
-        }
-    }
-}
-
-impl Display for MemAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(seg) = self.segment.as_ref() {
-            write!(f, "{}:", seg)?;
-        }
-
-        write!(f, "[")?;
-        let mut is_first = true;
-
-        if let Some(val) = self.reg1.as_ref() {
-            write!(f, "{}", val)?;
-            is_first = false;
-        }
-        if let Some(val) = self.reg2.as_ref() {
-            if !is_first {
-                write!(f, " + ")?;
-            }
-            write!(f, "{}", val)?;
-            is_first = false;
-        }
-
-        if let Some(val) = self.disp.as_ref() {
-            let is_neg = matches!(val, Literal::Byte(x) if *x < 0);
-            let connector = match (is_first, is_neg) {
-                (true, true) => "-",
-                (true, false) => "",
-                (false, true) => " - ",
-                (false, false) => " + ",
-            };
-            match val {
-                //Literal::Narrow(0) => (),
-                //Literal::Wide(0) => (),
-                Literal::Byte(x) => write!(f, "{}{}", connector, x.abs())?,
-                Literal::Word(x) => write!(f, "{}{}", connector, x)?,
-            }
-        };
-
-        write!(f, "]")
-    }
-}
-
+/// Match a byte `code` to a `Register`.
 fn parse_register(code: u8, wide: bool) -> Register {
-    match code {
-        0b000 => {
-            if wide {
-                Register::AX
-            } else {
-                Register::AL
-            }
-        }
-        0b001 => {
-            if wide {
-                Register::CX
-            } else {
-                Register::CL
-            }
-        }
-        0b010 => {
-            if wide {
-                Register::DX
-            } else {
-                Register::DL
-            }
-        }
-        0b011 => {
-            if wide {
-                Register::BX
-            } else {
-                Register::BL
-            }
-        }
-        0b100 => {
-            if wide {
-                Register::SP
-            } else {
-                Register::AH
-            }
-        }
-        0b101 => {
-            if wide {
-                Register::BP
-            } else {
-                Register::CH
-            }
-        }
-        0b110 => {
-            if wide {
-                Register::SI
-            } else {
-                Register::DH
-            }
-        }
-        0b111 => {
-            if wide {
-                Register::DI
-            } else {
-                Register::BH
-            }
-        }
-        _ => panic!("Unexpected register code {:?}", code),
+    if wide {
+        CODE_TO_REGISTER_WIDE
+            .get(&code)
+            .expect(&format!("Unexpected register code {:?}", code))
+            .clone()
+    } else {
+        CODE_TO_REGISTER
+            .get(&code)
+            .expect(&format!("Unexpected register code {:?}", code))
+            .clone()
     }
 }
 
+/// Match a byte `code` to a `Segment`.
 fn parse_segment(code: u8) -> Segment {
-    match code {
-        0b00 => Segment::ES,
-        0b01 => Segment::CS,
-        0b10 => Segment::SS,
-        0b11 => Segment::DS,
-        _ => panic!("Unexpected register code {:?}", code),
-    }
+    CODE_TO_SEGMENT
+        .get(&code)
+        .expect(&format!("Unexpected segment code {:?}", code))
+        .clone()
 }
 
-fn parse_segment_instr(input: &[u8]) -> IResult<&[u8], Segment> {
-    let (input, segment) = parse_code_segment(input, 0b001, 0b110)?;
-    Ok((input, segment))
+/// Represent `Vec<Instr>` as `String` for display.
+fn join_display_vec(items: Vec<Instr>) -> String {
+    items
+        .iter()
+        .map(|i| format!("{}", i))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn disassemble(path: &PathBuf) -> anyhow::Result<Vec<Instr>> {
@@ -510,17 +100,6 @@ pub fn disassemble(path: &PathBuf) -> anyhow::Result<Vec<Instr>> {
     );
     Ok(instrs)
 }
-
-#[derive(Debug)]
-pub struct ParseError(Vec<u8>);
-
-impl Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Parse error @ {}", print_vec_u8_bits(&self.0))
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 pub enum Displacement {
     D8,
@@ -786,6 +365,11 @@ fn parse_code_segment(input: &[u8], opcode1: u8, opcode2: u8) -> IResult<&[u8], 
             map(take(2usize), |code: u8| parse_segment(code)),
             tag(opcode2, 3usize),
         )))(input)?;
+    Ok((input, segment))
+}
+
+fn parse_segment_instr(input: &[u8]) -> IResult<&[u8], Segment> {
+    let (input, segment) = parse_code_segment(input, 0b001, 0b110)?;
     Ok((input, segment))
 }
 

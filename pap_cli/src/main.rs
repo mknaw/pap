@@ -22,26 +22,32 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     match &cli.command {
-        Commands::Disassemble { path } => match disassemble(path) {
-            Ok(instructions) => instructions.iter().for_each(|instr| println!("{}", instr)),
-            Err(e) => {
-                std::io::stderr()
-                    .write_all(e.to_string().as_bytes())
-                    .unwrap();
-                std::process::exit(1);
+        Commands::Disassemble { path } => {
+            let input = std::fs::read(path).unwrap();
+            match disassemble(input.as_slice()) {
+                Ok(instructions) => instructions.iter().for_each(|instr| println!("{}", instr)),
+                Err(e) => {
+                    std::io::stderr()
+                        .write_all(e.to_string().as_bytes())
+                        .unwrap();
+                    std::process::exit(1);
+                }
             }
-        },
-        Commands::Simulate { path } => match disassemble(path) {
-            Ok(instructions) => {
-                let state = simulate(&instructions);
-                println!("{}", state);
+        }
+        Commands::Simulate { path } => {
+            let input = std::fs::read(path).unwrap();
+            match disassemble(input.as_slice()) {
+                Ok(instructions) => {
+                    let state = simulate(&instructions);
+                    println!("{}", state);
+                }
+                Err(e) => {
+                    std::io::stderr()
+                        .write_all(e.to_string().as_bytes())
+                        .unwrap();
+                    std::process::exit(1);
+                }
             }
-            Err(e) => {
-                std::io::stderr()
-                    .write_all(e.to_string().as_bytes())
-                    .unwrap();
-                std::process::exit(1);
-            }
-        },
+        }
     }
 }

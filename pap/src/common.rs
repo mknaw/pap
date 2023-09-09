@@ -1,6 +1,6 @@
 use std::fmt::{self, Display};
 
-#[derive(Clone, strum_macros::Display)]
+#[derive(Clone, Copy, strum_macros::Display)]
 #[strum(serialize_all = "lowercase")]
 pub enum Register {
     AL,
@@ -21,6 +21,7 @@ pub enum Register {
     DI,
 }
 
+#[derive(Clone, Copy, Debug)]
 pub enum Literal {
     Byte(i8),
     Word(u16),
@@ -44,7 +45,7 @@ impl Display for Literal {
     }
 }
 
-#[derive(Clone, strum_macros::Display)]
+#[derive(Clone, Copy, strum_macros::Display)]
 #[strum(serialize_all = "lowercase")]
 pub enum Segment {
     CS,
@@ -53,6 +54,7 @@ pub enum Segment {
     SS,
 }
 
+#[derive(Eq, PartialEq, Clone, Copy, Debug)]
 pub enum Offset {
     Byte(i8),
     Word(i16),
@@ -60,12 +62,14 @@ pub enum Offset {
 
 impl Display for Offset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let val = match self {
-            Offset::Byte(val) => *val as i16,
-            Offset::Word(val) => *val,
+        let (val, instr_len) = match self {
+            Offset::Byte(val) => (*val as i16, 2),
+            Offset::Word(val) => (*val, 3),
         };
         let sign = if val < 0 { "-" } else { "+" };
-        let inc = (val + 2).abs();
+        // Offsets are given relative to the start of the instruction,
+        // so we need to add a correction to get the actual offset.
+        let inc = (val + instr_len).abs();
         write!(f, "${}{}", sign, inc)
     }
 }
@@ -172,7 +176,7 @@ impl Display for UnaryDest {
     }
 }
 
-#[derive(strum_macros::Display)]
+#[derive(strum_macros::Display, strum_macros::EnumString)]
 #[strum(serialize_all = "lowercase")]
 pub enum NullaryOp {
     Xlat,
@@ -212,7 +216,7 @@ pub enum NullaryOp {
     Wait,
 }
 
-#[derive(strum_macros::Display)]
+#[derive(strum_macros::Display, strum_macros::EnumString)]
 #[strum(serialize_all = "lowercase")]
 pub enum UnaryOp {
     Push,
@@ -226,14 +230,14 @@ pub enum UnaryOp {
     Idiv,
     Not,
     Call,
-    #[strum(serialize = "call far")]
+    #[strum(serialize = "call far", serialize = "callf")]
     Callf,
     Jmp,
-    #[strum(serialize = "jmp far")]
+    #[strum(serialize = "jmp far", serialize = "jmpf")]
     Jmpf,
 }
 
-#[derive(strum_macros::Display)]
+#[derive(strum_macros::Display, strum_macros::EnumString)]
 #[strum(serialize_all = "lowercase")]
 pub enum BinaryOp {
     Mov,
@@ -254,7 +258,7 @@ pub enum BinaryOp {
     Xor,
 }
 
-#[derive(strum_macros::Display)]
+#[derive(strum_macros::Display, strum_macros::EnumString)]
 #[strum(serialize_all = "lowercase")]
 pub enum ShiftRotOp {
     Shl,
@@ -266,7 +270,7 @@ pub enum ShiftRotOp {
     Rcr,
 }
 
-#[derive(strum_macros::Display)]
+#[derive(strum_macros::Display, strum_macros::EnumString)]
 #[strum(serialize_all = "lowercase")]
 pub enum JumpOp {
     Jnz,
@@ -291,14 +295,14 @@ pub enum JumpOp {
     Jcxz,
 }
 
-#[derive(strum_macros::Display)]
+#[derive(Clone, Copy, strum_macros::Display, strum_macros::EnumString)]
 #[strum(serialize_all = "lowercase")]
 pub enum ModifierOp {
-    Rep,
+    Rep(bool),
     Lock,
 }
 
-#[derive(strum_macros::Display)]
+#[derive(strum_macros::Display, strum_macros::EnumString)]
 #[strum(serialize_all = "lowercase")]
 pub enum ControlXferOp {
     Ret,
@@ -344,8 +348,11 @@ pub enum Instr {
         op: JumpOp,
         offset: Offset,
     },
-    ModifierInstr {
-        op: ModifierOp,
+    RepInstr {
+        instr: Box<Instr>,
+        zero_flag: bool,
+    },
+    LockInstr {
         instr: Box<Instr>,
     },
     ControlXferInstr {
@@ -378,8 +385,11 @@ impl Display for Instr {
             Instr::JumpInstr { op, offset: inc } => {
                 write!(f, "{} {}", op, inc)
             }
-            Instr::ModifierInstr { op, instr } => {
-                write!(f, "{} {}", op, instr)
+            Instr::RepInstr { instr, .. } => {
+                write!(f, "rep {}", instr)
+            }
+            Instr::LockInstr { instr } => {
+                write!(f, "lock {}", instr)
             }
             Instr::ControlXferInstr { op, value } => {
                 if let Some(value) = value {
@@ -388,6 +398,30 @@ impl Display for Instr {
                     write!(f, "{}", op)
                 }
             }
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub enum Displacement {
+    D8,
+    D16,
+}
+
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub enum MovMode {
+    MemMode(Option<Displacement>),
+    RegMode,
+}
+
+impl From<u8> for MovMode {
+    fn from(code: u8) -> Self {
+        match code {
+            0b00 => MovMode::MemMode(None),
+            0b01 => MovMode::MemMode(Some(Displacement::D8)),
+            0b10 => MovMode::MemMode(Some(Displacement::D16)),
+            0b11 => MovMode::RegMode,
+            _ => panic!("invalid input code"),
         }
     }
 }

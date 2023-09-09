@@ -1,0 +1,138 @@
+xlat   11010111
+lahf   10011111
+sahf   10011110
+pushf  10011100
+popf   10011101
+aaa    00110111
+daa    00100111
+aas    00111111
+das    00101111
+das    00101111
+cbw    10011000
+cwd    10011001
+int3   11001100
+movsb  10100100
+cmpsb  10100110
+scasb  10101110
+lodsb  10101100
+movsw  10100101
+cmpsw  10100111
+scasw  10101111
+lodsw  10101101
+stosb  10101010
+stosw  10101011
+into   11001110
+iret   11001111
+clc    11111000
+cmc    11110101
+stc    11111001
+cld    11111100
+std    11111101
+cli    11111010
+sti    11111011
+hlt    11110100
+wait   10011011
+aam    11010100    00001010
+aad    11010101    00001010
+push   1111111 W   MOD 110 RM
+pop    1000111 W   MOD 000 RM
+inc    1111111 W   MOD 000 RM
+dec    1111111 W   MOD 001 RM
+neg    1111011 W   MOD 011 RM
+mul    1111011 W   MOD 100 RM
+imul   1111011 W   MOD 101 RM
+div    1111011 W   MOD 110 RM
+idiv   1111011 W   MOD 111 RM
+not    1111011 W   MOD 010 RM
+call   1111111 W   MOD 010 RM
+callf  1111111 W   MOD 011 RM
+jmp    1111111 W   MOD 100 RM
+jmpf   1111111 W   MOD 101 RM
+push   01010 REG
+pop    01011 REG
+inc    01000 REG
+dec    01001 REG
+push   000 SR 110
+pop    000 SR 111
+call   10011010    END START
+jmp    11101010    END START
+call   11101000    OFFSETW
+jmp    11101001    OFFSETW
+jmp    11101011    OFFSET
+mov    1011 W REG
+mov    100010 D W  MOD REG RM
+add    000000 D W  MOD REG RM
+sub    001010 D W  MOD REG RM
+cmp    001110 D W  MOD REG RM
+adc    000100 D W  MOD REG RM
+sbb    000110 D W  MOD REG RM
+and    001000 D W  MOD REG RM
+or     000010 D W  MOD REG RM
+xor    001100 D W  MOD REG RM
+xchg   1000011 W   MOD REG RM
+test   1000010 W   MOD REG RM
+mov    10001110    MOD 0 SR RM
+mov    10001100    MOD 0 SR RM
+lea    10001101    MOD REG RM
+lds    11000101    MOD REG RM
+les    11000100    MOD REG RM
+mov    1100011 W   MOD 000 RM
+add    100000 S W  MOD 000 RM
+sub    100000 S W  MOD 101 RM
+cmp    100000 S W  MOD 111 RM
+adc    100000 S W  MOD 010 RM
+sbb    100000 S W  MOD 011 RM
+and    100000 S W  MOD 100 RM
+test   111101 S W  MOD 000 RM
+or     100000 S W  MOD 001 RM
+xor    100000 S W  MOD 110 RM
+mov    1010000 W
+mov    1010001 W
+add    0000010 W
+sub    0010110 W
+cmp    0011110 W
+adc    0001010 W
+sbb    0001110 W
+and    0010010 W
+test   1010100 W
+or     0000110 W
+xor    0011010 W
+xchg   10010 REG
+in     1110010 W
+out    1110011 W
+in     1110110 W
+out    1110111 W
+shl    110100 V W  MOD 100 RM
+shr    110100 V W  MOD 101 RM
+sar    110100 V W  MOD 111 RM
+rol    110100 V W  MOD 000 RM
+ror    110100 V W  MOD 001 RM
+rcl    110100 V W  MOD 010 RM
+rcr    110100 V W  MOD 011 RM
+jo     01110000
+jno    01110001
+jb     01110010
+jnb    01110011
+je     01110100
+jnz    01110101
+jbe    01110110
+ja     01110111
+js     01111000
+jns    01111001
+jp     01111010
+jnp    01111011
+jl     01111100
+jnl    01111101
+jle    01111110
+jg     01111111
+loopnz 11100000
+loopz  11100001
+loop   11100010
+jcxz   11100011
+rep    1111001 Z
+lock   1111000 Z
+ret    11000011
+retf   11001011
+ret    11000010
+int    11001101
+retf   11001010

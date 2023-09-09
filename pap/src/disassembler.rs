@@ -1,20 +1,24 @@
 use std::collections::HashMap;
-use std::fmt::{self, Display};
-use std::path::PathBuf;
+use std::str::FromStr;
 
-use nom::bits::bits;
-use nom::bits::complete::{tag, take};
-use nom::branch::alt;
-use nom::bytes::complete::{tag as tag_bytes, take as take_bytes};
-use nom::combinator::{iterator, map, opt};
-use nom::sequence::tuple;
-use nom::IResult;
+use anyhow::anyhow;
+use bitvec::prelude::*;
 
-use crate::common::*;
-use crate::utils::print_vec_u8_bits;
+use crate::{
+    common::*,
+    dsl::{construct_instruction_set, InstructionPart, Spec},
+};
 
-// Common lookup tables.
+type BitV = BitVec<u8, Msb0>;
+type BitS = BitSlice<u8, Msb0>;
+type SpecMap<'a> = HashMap<BitV, &'a Spec>;
+
 lazy_static! {
+    static ref SPECS: Vec<Spec> = construct_instruction_set();
+    // Could probably write a serialized version of `SPEC_MAP` to disk and load
+    // at runtime instead of doing the combinatorics, but the combinatorics seem
+    // fast enough for the purposes of this exercise.
+    static ref SPEC_MAP: SpecMap<'static> = construct_spec_map(&SPECS);
     static ref CODE_TO_REGISTER: HashMap<u8, Register> = HashMap::from([
         (0b000, Register::AL),
         (0b001, Register::CL),
@@ -35,6 +39,12 @@ lazy_static! {
         (0b110, Register::SI),
         (0b111, Register::DI),
     ]);
+    static ref CODE_TO_MOD_MODE: HashMap<u8, MovMode> = HashMap::from([
+        (0b00, MovMode::MemMode(None)),
+        (0b01, MovMode::MemMode(Some(Displacement::D8))),
+        (0b10, MovMode::MemMode(Some(Displacement::D16))),
+        (0b11, MovMode::RegMode),
+    ]);
     static ref CODE_TO_SEGMENT: HashMap<u8, Segment> = HashMap::from([
         (0b00, Segment::ES),
         (0b01, Segment::CS),
@@ -43,529 +53,594 @@ lazy_static! {
     ]);
 }
 
+trait OptionZip {
+    type Output;
+
+    fn zip(self) -> Option<Self::Output>;
+}
+
+impl<A, B, C> OptionZip for (Option<A>, Option<B>, Option<C>) {
+    type Output = (A, B, C);
+
+    fn zip(self) -> Option<Self::Output> {
+        match self {
+            (Some(a), Some(b), Some(c)) => Some((a, b, c)),
+            _ => None,
+        }
+    }
+}
+
+impl<A, B, C, D, E> OptionZip for (Option<A>, Option<B>, Option<C>, Option<D>, Option<E>) {
+    type Output = (A, B, C, D, E);
+
+    fn zip(self) -> Option<Self::Output> {
+        match self {
+            (Some(a), Some(b), Some(c), Some(d), Some(e)) => Some((a, b, c, d, e)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
-pub struct ParseError(Vec<u8>);
+struct IntermediateInstr {
+    mnemonic: String,
+    code: BitV,
+    w: Option<bool>,
+    s: Option<bool>,
+    d: Option<bool>,
+    v: Option<bool>,
+    z: Option<bool>,
+    reg: Option<u8>,
+    rm: Option<u8>,
+    mm: Option<u8>,
+    sr: Option<u8>,
+    start: Option<Literal>,
+    end: Option<Literal>,
+    offset: Option<Offset>,
+}
 
-impl Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Parse error @ {}", print_vec_u8_bits(&self.0))
+#[derive(Debug)]
+enum BitSchemaPart {
+    Fixed(BitV),     // Fixed value with a number of bits
+    Variable(usize), // Variable value with a bit length
+}
+
+// TODO there should be no need to first allocate to a `Vec` just to move it to `HashMap`
+fn generate_combinations(bit_schema: &[BitSchemaPart]) -> Vec<BitV> {
+    let mut combinations = vec![BitVec::new()];
+
+    for schema in bit_schema {
+        let new_combinations = combinations
+            .iter()
+            .flat_map(|combo| match schema {
+                BitSchemaPart::Fixed(value) => {
+                    let mut value = value.clone();
+                    let mut combo = combo.clone();
+                    combo.append(&mut value);
+                    vec![combo]
+                }
+                BitSchemaPart::Variable(length) => (0..(1 << length))
+                    .map(|i| {
+                        let mut new_combo = combo.clone();
+                        for j in 0..*length {
+                            new_combo.push((i & (1 << j)) != 0);
+                        }
+                        new_combo
+                    })
+                    .collect::<Vec<_>>(),
+            })
+            .collect();
+
+        combinations = new_combinations;
     }
+    combinations
 }
 
-impl std::error::Error for ParseError {}
-
-/// Match a byte `code` to a `Register`.
-fn parse_register(code: u8, wide: bool) -> Register {
-    if wide {
-        CODE_TO_REGISTER_WIDE
-            .get(&code)
-            .expect(&format!("Unexpected register code {:?}", code))
-            .clone()
-    } else {
-        CODE_TO_REGISTER
-            .get(&code)
-            .expect(&format!("Unexpected register code {:?}", code))
-            .clone()
-    }
-}
-
-/// Match a byte `code` to a `Segment`.
-fn parse_segment(code: u8) -> Segment {
-    CODE_TO_SEGMENT
-        .get(&code)
-        .expect(&format!("Unexpected segment code {:?}", code))
-        .clone()
-}
-
-/// Represent `Vec<Instr>` as `String` for display.
-fn join_display_vec(items: Vec<Instr>) -> String {
-    items
-        .iter()
-        .map(|i| format!("{}", i))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-pub fn disassemble(path: &PathBuf) -> anyhow::Result<Vec<Instr>> {
-    let data = std::fs::read(path)?;
-    let input = data.as_slice();
-    let mut it = iterator(input, parse_instr);
-    let instrs = it.collect::<Vec<Instr>>();
-    let (rest, _) = it.finish().unwrap();
-    // TODO really should be a Result, not this panic.
-    assert!(
-        rest.is_empty(),
-        "Did not parse whole input!\n{}",
-        join_display_vec(instrs)
-    );
-    Ok(instrs)
-}
-
-pub enum Displacement {
-    D8,
-    D16,
-}
-
-pub enum MovMode {
-    MemMode(Option<Displacement>),
-    RegMode,
-}
-
-impl From<u8> for MovMode {
-    fn from(code: u8) -> Self {
-        match code {
-            0b00 => MovMode::MemMode(None),
-            0b01 => MovMode::MemMode(Some(Displacement::D8)),
-            0b10 => MovMode::MemMode(Some(Displacement::D16)),
-            0b11 => MovMode::RegMode,
-            _ => panic!("invalid input code"),
+fn spec_to_bit_schema(spec: &Spec) -> Vec<BitSchemaPart> {
+    let mut schema = vec![BitSchemaPart::Fixed(spec.code.clone())];
+    for part in spec.rest.iter() {
+        if let Some(part) = match part {
+            InstructionPart::W
+            | InstructionPart::S
+            | InstructionPart::D
+            | InstructionPart::V
+            | InstructionPart::Z => Some(BitSchemaPart::Variable(1)),
+            InstructionPart::MOD | InstructionPart::SR => Some(BitSchemaPart::Variable(2)),
+            InstructionPart::REG | InstructionPart::RM => Some(BitSchemaPart::Variable(3)),
+            InstructionPart::Literal(bits) => Some(BitSchemaPart::Fixed(bits.clone())),
+            _ => None,
+        } {
+            schema.push(part);
         }
     }
+    schema
 }
 
-/// Parse some instruction from the bits.
-fn parse_instr(input: &[u8]) -> IResult<&[u8], Instr> {
-    alt((
-        // `NullaryInstr`s
-        alt((
-            alt((
-                |input| parse_nullary_op(input, &[0b11010111], NullaryOp::Xlat),
-                |input| parse_nullary_op(input, &[0b10011111], NullaryOp::Lahf),
-                |input| parse_nullary_op(input, &[0b10011110], NullaryOp::Sahf),
-                |input| parse_nullary_op(input, &[0b10011100], NullaryOp::Pushf),
-                |input| parse_nullary_op(input, &[0b10011101], NullaryOp::Popf),
-                |input| parse_nullary_op(input, &[0b00110111], NullaryOp::Aaa),
-                |input| parse_nullary_op(input, &[0b00100111], NullaryOp::Daa),
-                |input| parse_nullary_op(input, &[0b00111111], NullaryOp::Aas),
-                |input| parse_nullary_op(input, &[0b00101111], NullaryOp::Das),
-                |input| parse_nullary_op(input, &[0b00101111], NullaryOp::Das),
-                |input| parse_nullary_op(input, &[0b10011000], NullaryOp::Cbw),
-                |input| parse_nullary_op(input, &[0b10011001], NullaryOp::Cwd),
-                |input| parse_nullary_op(input, &[0b11001100], NullaryOp::Int3),
-                |input| parse_nullary_op(input, &[0b11010100, 0b00001010], NullaryOp::Aam),
-                |input| parse_nullary_op(input, &[0b11010101, 0b00001010], NullaryOp::Aad),
-            )),
-            alt((
-                |input| parse_nullary_op(input, &[0b10100100], NullaryOp::Movsb),
-                |input| parse_nullary_op(input, &[0b10100110], NullaryOp::Cmpsb),
-                |input| parse_nullary_op(input, &[0b10101110], NullaryOp::Scasb),
-                |input| parse_nullary_op(input, &[0b10101100], NullaryOp::Lodsb),
-                |input| parse_nullary_op(input, &[0b10100101], NullaryOp::Movsw),
-                |input| parse_nullary_op(input, &[0b10100111], NullaryOp::Cmpsw),
-                |input| parse_nullary_op(input, &[0b10101111], NullaryOp::Scasw),
-                |input| parse_nullary_op(input, &[0b10101101], NullaryOp::Lodsw),
-                |input| parse_nullary_op(input, &[0b10101010], NullaryOp::Stosb),
-                |input| parse_nullary_op(input, &[0b10101011], NullaryOp::Stosw),
-            )),
-            alt((
-                |input| parse_nullary_op(input, &[0b11001110], NullaryOp::Into),
-                |input| parse_nullary_op(input, &[0b11001111], NullaryOp::Iret),
-                |input| parse_nullary_op(input, &[0b11111000], NullaryOp::Clc),
-                |input| parse_nullary_op(input, &[0b11110101], NullaryOp::Cmc),
-                |input| parse_nullary_op(input, &[0b11111001], NullaryOp::Stc),
-                |input| parse_nullary_op(input, &[0b11111100], NullaryOp::Cld),
-                |input| parse_nullary_op(input, &[0b11111101], NullaryOp::Std),
-                |input| parse_nullary_op(input, &[0b11111010], NullaryOp::Cli),
-                |input| parse_nullary_op(input, &[0b11111011], NullaryOp::Sti),
-                |input| parse_nullary_op(input, &[0b11110100], NullaryOp::Hlt),
-                |input| parse_nullary_op(input, &[0b10011011], NullaryOp::Wait),
-            )),
-        )),
-        // `UnaryInstr`s
-        alt((
-            |input| parse_unary_rm(input, 0b1111111, 0b110, UnaryOp::Push),
-            |input| parse_unary_rm(input, 0b1000111, 0b000, UnaryOp::Pop),
-            |input| parse_unary_rm(input, 0b1111111, 0b000, UnaryOp::Inc),
-            |input| parse_unary_rm(input, 0b1111111, 0b001, UnaryOp::Dec),
-            |input| parse_unary_rm(input, 0b1111011, 0b011, UnaryOp::Neg),
-            |input| parse_unary_rm(input, 0b1111011, 0b100, UnaryOp::Mul),
-            |input| parse_unary_rm(input, 0b1111011, 0b101, UnaryOp::Imul),
-            |input| parse_unary_rm(input, 0b1111011, 0b110, UnaryOp::Div),
-            |input| parse_unary_rm(input, 0b1111011, 0b111, UnaryOp::Idiv),
-            |input| parse_unary_rm(input, 0b1111011, 0b010, UnaryOp::Not),
-            |input| parse_unary_rm(input, 0b1111111, 0b010, UnaryOp::Call),
-            |input| parse_unary_rm(input, 0b1111111, 0b011, UnaryOp::Callf),
-            |input| parse_unary_rm(input, 0b1111111, 0b100, UnaryOp::Jmp),
-            |input| parse_unary_rm(input, 0b1111111, 0b101, UnaryOp::Jmpf),
-        )),
-        alt((
-            |input| parse_unary_reg(input, 0b01010, UnaryOp::Push),
-            |input| parse_unary_reg(input, 0b01011, UnaryOp::Pop),
-            |input| parse_unary_reg(input, 0b01000, UnaryOp::Inc),
-            |input| parse_unary_reg(input, 0b01001, UnaryOp::Dec),
-            |input| parse_unary_segreg(input, 0b000, 0b110, UnaryOp::Push),
-            |input| parse_unary_segreg(input, 0b000, 0b111, UnaryOp::Pop),
-            |input| parse_unary_interseg(input, 0b10011010, UnaryOp::Call),
-            |input| parse_unary_interseg(input, 0b11101010, UnaryOp::Jmp),
-            |input| parse_unary_offset(input, 0b11101001, UnaryOp::Jmp),
-            |input| parse_unary_offset(input, 0b11101000, UnaryOp::Call),
-        )),
-        // `BinaryInstr`s
-        alt((
-            parse_mov_imd_to_reg,
-            |input| parse_rm_to_rm(input, 0b100010, false, BinaryOp::Mov),
-            |input| parse_rm_to_rm(input, 0b000000, false, BinaryOp::Add),
-            |input| parse_rm_to_rm(input, 0b001010, false, BinaryOp::Sub),
-            |input| parse_rm_to_rm(input, 0b001110, false, BinaryOp::Cmp),
-            |input| parse_rm_to_rm(input, 0b000100, false, BinaryOp::Adc),
-            |input| parse_rm_to_rm(input, 0b000110, false, BinaryOp::Sbb),
-            |input| parse_rm_to_rm(input, 0b001000, false, BinaryOp::And),
-            |input| parse_rm_to_rm(input, 0b000100, false, BinaryOp::Test),
-            |input| parse_rm_to_rm(input, 0b000010, false, BinaryOp::Or),
-            |input| parse_rm_to_rm(input, 0b001100, false, BinaryOp::Xor),
-            |input| parse_rm_to_rm(input, 0b1000011, true, BinaryOp::Xchg),
-            |input| parse_rm_to_rm(input, 0b1000010, true, BinaryOp::Test),
-            |input| parse_binary_segreg(input, 0b10001100, false, BinaryOp::Mov),
-        )),
-        alt((
-            |input| parse_load(input, 0b10001101, BinaryOp::Lea),
-            |input| parse_load(input, 0b11000101, BinaryOp::Lds),
-            |input| parse_load(input, 0b11000100, BinaryOp::Les),
-        )),
-        alt((
-            |input| parse_imd_to_rm(input, 0b110001, 0b000, true, BinaryOp::Mov),
-            |input| parse_imd_to_rm(input, 0b100000, 0b000, false, BinaryOp::Add),
-            |input| parse_imd_to_rm(input, 0b100000, 0b101, false, BinaryOp::Sub),
-            |input| parse_imd_to_rm(input, 0b100000, 0b111, false, BinaryOp::Cmp),
-            |input| parse_imd_to_rm(input, 0b100000, 0b010, false, BinaryOp::Adc),
-            |input| parse_imd_to_rm(input, 0b100000, 0b011, false, BinaryOp::Sbb),
-            |input| parse_imd_to_rm(input, 0b100000, 0b100, false, BinaryOp::And),
-            |input| parse_imd_to_rm(input, 0b111101, 0b000, false, BinaryOp::Test),
-            |input| parse_imd_to_rm(input, 0b100000, 0b001, false, BinaryOp::Or),
-            |input| parse_imd_to_rm(input, 0b100000, 0b110, false, BinaryOp::Xor),
-        )),
-        alt((
-            // TODO do I really need 2 of these for `Mov`? maybe can just get it from the last bit.
-            |input| parse_accum_style(input, 0b1010000, true, BinaryOp::Mov),
-            |input| parse_accum_style(input, 0b1010001, false, BinaryOp::Mov),
-            |input| parse_accum_style(input, 0b0000010, true, BinaryOp::Add),
-            |input| parse_accum_style(input, 0b0010110, true, BinaryOp::Sub),
-            |input| parse_accum_style(input, 0b0011110, true, BinaryOp::Cmp),
-            |input| parse_accum_style(input, 0b0001010, true, BinaryOp::Adc),
-            |input| parse_accum_style(input, 0b0001110, true, BinaryOp::Sbb),
-            |input| parse_accum_style(input, 0b0010010, true, BinaryOp::And),
-            |input| parse_accum_style(input, 0b1010100, true, BinaryOp::Test),
-            |input| parse_accum_style(input, 0b0000110, true, BinaryOp::Or),
-            |input| parse_accum_style(input, 0b0011010, true, BinaryOp::Xor),
-            |input| parse_accum_reg(input, 0b10010, BinaryOp::Xchg),
-            // TODO you get a warning about negative literals for `In`, among others
-            |input| parse_fixed_port(input, 0b1110010, true, BinaryOp::In),
-            |input| parse_fixed_port(input, 0b1110011, false, BinaryOp::Out),
-            |input| parse_variable_port(input, 0b1110110, true, BinaryOp::In),
-            |input| parse_variable_port(input, 0b1110111, false, BinaryOp::Out),
-        )),
-        alt((
-            |input| parse_shift_rotate(input, 0b110100, 0b100, ShiftRotOp::Shl),
-            |input| parse_shift_rotate(input, 0b110100, 0b101, ShiftRotOp::Shr),
-            |input| parse_shift_rotate(input, 0b110100, 0b111, ShiftRotOp::Sar),
-            |input| parse_shift_rotate(input, 0b110100, 0b000, ShiftRotOp::Rol),
-            |input| parse_shift_rotate(input, 0b110100, 0b001, ShiftRotOp::Ror),
-            |input| parse_shift_rotate(input, 0b110100, 0b010, ShiftRotOp::Rcl),
-            |input| parse_shift_rotate(input, 0b110100, 0b011, ShiftRotOp::Rcr),
-        )),
-        // `JumpInstr`s
-        alt((
-            |input| parse_jump_instr(input, 0b01110000, JumpOp::Jo),
-            |input| parse_jump_instr(input, 0b01110001, JumpOp::Jno),
-            |input| parse_jump_instr(input, 0b01110010, JumpOp::Jb),
-            |input| parse_jump_instr(input, 0b01110011, JumpOp::Jnb),
-            |input| parse_jump_instr(input, 0b01110100, JumpOp::Je),
-            |input| parse_jump_instr(input, 0b01110101, JumpOp::Jnz),
-            |input| parse_jump_instr(input, 0b01110110, JumpOp::Jbe),
-            |input| parse_jump_instr(input, 0b01110111, JumpOp::Ja),
-            |input| parse_jump_instr(input, 0b01111000, JumpOp::Js),
-            |input| parse_jump_instr(input, 0b01111001, JumpOp::Jns),
-            |input| parse_jump_instr(input, 0b01111010, JumpOp::Jp),
-            |input| parse_jump_instr(input, 0b01111011, JumpOp::Jnp),
-            |input| parse_jump_instr(input, 0b01111100, JumpOp::Jl),
-            |input| parse_jump_instr(input, 0b01111101, JumpOp::Jnl),
-            |input| parse_jump_instr(input, 0b01111110, JumpOp::Jle),
-            |input| parse_jump_instr(input, 0b01111111, JumpOp::Jg),
-            |input| parse_jump_instr(input, 0b11100000, JumpOp::Loopnz),
-            |input| parse_jump_instr(input, 0b11100001, JumpOp::Loopz),
-            |input| parse_jump_instr(input, 0b11100010, JumpOp::Loop),
-            |input| parse_jump_instr(input, 0b11100011, JumpOp::Jcxz),
-        )),
-        // `ModifierInstr`s
-        alt((
-            |input| parse_repeat_instr(input, 0b1111001, ModifierOp::Rep),
-            // TODO actually an 8bit opcode... although it is "not used."
-            |input| parse_repeat_instr(input, 0b1111000, ModifierOp::Lock),
-        )),
-        // `ControlXferInstr`s
-        alt((
-            |input| parse_control_xfer_nullary_op(input, 0b11000011, ControlXferOp::Ret),
-            |input| parse_control_xfer_nullary_op(input, 0b11001011, ControlXferOp::Retf),
-        )),
-        alt((
-            |input| parse_control_xfer(input, 0b11000010, ControlXferOp::Ret, true),
-            |input| parse_control_xfer(input, 0b11001101, ControlXferOp::Int, false),
-            |input| parse_control_xfer(input, 0b11001010, ControlXferOp::Retf, true),
-        )),
-    ))(input)
+fn construct_spec_map(specs: &[Spec]) -> SpecMap {
+    let mut spec_map = HashMap::new();
+    for spec in specs {
+        let bit_schemas = spec_to_bit_schema(spec);
+        for combo in generate_combinations(&bit_schemas) {
+            assert!(
+                combo.len() == 8 || combo.len() == 16,
+                "{:?} {:?}",
+                spec,
+                combo
+            );
+            spec_map.insert(combo, spec);
+        }
+    }
+    spec_map
 }
 
-fn parse_nullary_op<'a, 'b>(
-    input: &'a [u8],
-    opcode: &'b [u8],
-    op: NullaryOp,
-) -> IResult<&'a [u8], Instr> {
-    let (input, _) = tag_bytes(opcode)(input)?;
-    Ok((input, Instr::NullaryInstr { op }))
+pub fn disassemble(input: &[u8]) -> anyhow::Result<Vec<Instr>> {
+    let mut parser = Disassembler::new(input.view_bits::<Msb0>());
+    parser.disassemble()
 }
 
-fn parse_mod_reg_rm_byte(input: &[u8], wide: bool) -> IResult<&[u8], (MovMode, Register, u8)> {
-    bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(tuple((
-        map(take(2usize), |code: u8| code.into()),
-        map(take(3usize), |code: u8| parse_register(code, wide)),
-        take(3usize),
-    )))(input)
+struct Disassembler<'a> {
+    bits: &'a BitS,
+    modifier: Option<ModifierOp>,
+    segment: Option<Segment>,
 }
 
-fn parse_6bits_and_flags(input: &[u8], opcode: u8) -> IResult<&[u8], (bool, bool)> {
-    let (input, (_, a, b)): (&[u8], (u8, bool, bool)) =
-        bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(tuple((
-            tag(opcode, 6usize),
-            map(take(1usize), |x: u8| x == 1),
-            map(take(1usize), |x: u8| x == 1),
-        )))(input)?;
-    Ok((input, (a, b)))
-}
+impl<'a> Disassembler<'a> {
+    pub fn new(bits: &'a BitS) -> Self {
+        Self {
+            bits,
+            modifier: None,
+            segment: None,
+        }
+    }
 
-fn parse_7bits_and_flag(input: &[u8], opcode: u8) -> IResult<&[u8], bool> {
-    let (input, (_, a)): (&[u8], (u8, bool)) = bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(
-        tuple((tag(opcode, 7usize), map(take(1usize), |x: u8| x == 1))),
-    )(input)?;
-    Ok((input, a))
-}
+    fn is_finished(&self) -> bool {
+        self.bits.is_empty()
+    }
 
-fn parse_mod_code_rm(input: &[u8], opcode: u8) -> IResult<&[u8], (MovMode, u8)> {
-    let (input, (mode, _, rm)): (&[u8], (MovMode, u8, u8)) =
-        bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(tuple((
-            map(take(2usize), |code: u8| code.into()),
-            tag(opcode, 3usize),
-            take(3usize),
-        )))(input)?;
-    Ok((input, (mode, rm)))
-}
+    pub fn disassemble(&mut self) -> anyhow::Result<Vec<Instr>> {
+        let mut result = Vec::new();
+        while !self.is_finished() {
+            if let Some(instr) = self.disassemble_one()? {
+                match self.modifier {
+                    Some(ModifierOp::Rep(z)) => {
+                        result.push(Instr::RepInstr {
+                            instr: Box::new(instr),
+                            zero_flag: z,
+                        });
+                    }
+                    Some(ModifierOp::Lock) => {
+                        result.push(Instr::LockInstr {
+                            instr: Box::new(instr),
+                        });
+                    }
+                    _ => {
+                        result.push(instr);
+                    }
+                }
+                self.modifier = None;
+            }
+        }
 
-fn parse_code_register(input: &[u8], opcode: u8) -> IResult<&[u8], Register> {
-    let (input, (_, reg)): (&[u8], (u8, Register)) =
-        bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(tuple((
-            tag(opcode, 5usize),
-            map(take(3usize), |code: u8| parse_register(code, true)),
-        )))(input)?;
-    Ok((input, reg))
-}
+        if self.is_finished() {
+            Ok(result)
+        } else {
+            Err(anyhow!("not all bytes were parsed!"))
+        }
+    }
 
-fn parse_code_segment(input: &[u8], opcode1: u8, opcode2: u8) -> IResult<&[u8], Segment> {
-    let (input, (_, segment, _)): (&[u8], (u8, Segment, u8)) =
-        bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(tuple((
-            tag(opcode1, 3usize),
-            map(take(2usize), |code: u8| parse_segment(code)),
-            tag(opcode2, 3usize),
-        )))(input)?;
-    Ok((input, segment))
-}
+    fn disassemble_one(&mut self) -> anyhow::Result<Option<Instr>> {
+        if let Some(segment) = self.try_segment()? {
+            if self.segment.is_none() {
+                self.segment = Some(segment);
+                return Ok(None);
+            } else {
+                anyhow::bail!("unexpected doubled segment set");
+            }
+        }
 
-fn parse_segment_instr(input: &[u8]) -> IResult<&[u8], Segment> {
-    let (input, segment) = parse_code_segment(input, 0b001, 0b110)?;
-    Ok((input, segment))
-}
+        let spec = SPEC_MAP
+            .get(&self.bits[..8].to_bitvec())
+            .or_else(|| SPEC_MAP.get(&self.bits[..16].to_bitvec()))
+            .ok_or_else(|| anyhow!("no matching spec: {:08b}", self.bits[..8].load::<u8>()))?;
 
-/// Parse register/memory/immediate to/from register/memory instructions.
-fn parse_rm_to_rm(
-    input: &[u8],
-    opcode: u8,
-    parse_seven: bool,
-    op: BinaryOp,
-) -> IResult<&[u8], Instr> {
-    let (input, segment) = opt(parse_segment_instr)(input)?;
+        if let Some(intermediate) = self.try_spec(spec)? {
+            return self.intermediate_to_instr(intermediate);
+        }
 
-    // First byte
-    let (input, destination, wide) = if parse_seven {
-        let (input, wide) = parse_7bits_and_flag(input, opcode)?;
-        // TODO kinda gross!
-        let destination = match op {
-            BinaryOp::Test => false,
-            _ => true,
+        anyhow::bail!("no matching spec: {:08b}", self.bits[..8].load::<u8>())
+    }
+
+    fn try_segment(&mut self) -> anyhow::Result<Option<Segment>> {
+        let (head, bits) = self.bits.split_at(3);
+        if head.load::<u8>() != 0b001 {
+            return Ok(None);
+        }
+        let (sr, bits) = bits.split_at(2);
+        let (head, bits) = bits.split_at(3);
+        if head.load::<u8>() != 0b110 {
+            return Ok(None);
+        }
+        let sr = sr.load();
+        self.bits = bits;
+        CODE_TO_SEGMENT
+            .get(&sr)
+            .copied()
+            .map_or(Err(anyhow!("Unexpected segment code {:?}", sr)), |seg| {
+                Ok(Some(seg))
+            })
+    }
+
+    fn try_spec(&mut self, spec: &Spec) -> anyhow::Result<Option<IntermediateInstr>> {
+        let mut w = None;
+        let mut s = None;
+        let mut d = None;
+        let mut v = None;
+        let mut z = None;
+        let mut reg = None;
+        let mut rm = None;
+        let mut mm = None;
+        let mut sr = None;
+        let mut start = None;
+        let mut end = None;
+        let mut offset = None;
+
+        macro_rules! split_bits {
+            ($var:expr, $n:expr) => {{
+                if self.bits.len() < $n {
+                    return Ok(None);
+                }
+                let (head, tail) = self.bits.split_at($n);
+                self.bits = tail;
+                $var = Some(head.to_bitvec())
+            }};
+        }
+
+        for part in spec.iterate_parts() {
+            match part {
+                InstructionPart::Literal(lit) => {
+                    if self.bits.len() < lit.len() {
+                        return Ok(None);
+                    }
+                    let (head, tail) = self.bits.split_at(lit.len());
+                    self.bits = tail;
+                    if head != lit {
+                        return Ok(None);
+                    }
+                }
+                InstructionPart::W => split_bits!(w, 1),
+                InstructionPart::S => split_bits!(s, 1),
+                InstructionPart::D => split_bits!(d, 1),
+                InstructionPart::V => split_bits!(v, 1),
+                InstructionPart::Z => split_bits!(z, 1),
+                InstructionPart::REG => split_bits!(reg, 3),
+                InstructionPart::RM => split_bits!(rm, 3),
+                InstructionPart::MOD => split_bits!(mm, 2),
+                InstructionPart::SR => split_bits!(sr, 2),
+                InstructionPart::START => {
+                    let literal = self.parse_literal(true)?;
+                    start = Some(literal);
+                }
+                InstructionPart::END => {
+                    let literal = self.parse_literal(true)?;
+                    end = Some(literal);
+                }
+                InstructionPart::OFFSET => {
+                    let (tail, literal) = parse_offset_byte(self.bits);
+                    self.bits = tail;
+                    offset = Some(literal);
+                }
+                InstructionPart::OFFSETW => {
+                    let (tail, literal) = parse_offset_word(self.bits);
+                    self.bits = tail;
+                    offset = Some(literal);
+                }
+            }
+        }
+        Ok(Some(IntermediateInstr {
+            mnemonic: spec.mnemonic.clone(),
+            code: spec.code.clone(),
+            w: w.map(|b| b[0]),
+            s: s.map(|b| b[0]),
+            d: d.map(|b| b[0]),
+            v: v.map(|b| b[0]),
+            z: z.map(|b| b[0]),
+            reg: reg.map(|b| b.load::<u8>()),
+            rm: rm.map(|b| b.load::<u8>()),
+            mm: mm.map(|b| b.load::<u8>()),
+            sr: sr.map(|b| b.load::<u8>()),
+            start,
+            end,
+            offset,
+        }))
+    }
+
+    fn parse_rm(&mut self, rm: u8, mm: u8, wide: Option<bool>) -> anyhow::Result<RM> {
+        let mode = &parse_mod_mode(mm)?;
+        let rm = match mode {
+            MovMode::MemMode(disp) => {
+                let (rest, disp) = match disp {
+                    None => {
+                        if rm == 0b110 {
+                            let literal = self.parse_literal(true)?;
+                            (self.bits, Some(literal))
+                        } else {
+                            (self.bits, None)
+                        }
+                    }
+                    Some(Displacement::D8) => {
+                        let literal = self.parse_literal(false)?;
+                        (self.bits, Some(literal))
+                    }
+                    Some(Displacement::D16) => {
+                        let literal = self.parse_literal(true)?;
+                        (self.bits, Some(literal))
+                    }
+                };
+                let mem_addr = parse_effective_address(mode, rm, disp, self.segment)?;
+                self.bits = rest;
+                Ok(RM::Mem(mem_addr))
+            }
+            MovMode::RegMode => match wide {
+                Some(w) => {
+                    let register = parse_register(rm, w)?;
+                    Ok(RM::Reg(register))
+                }
+                _ => anyhow::bail!("need non-None `wide` for register mode"),
+            },
         };
-        (input, destination, wide)
-    } else {
-        let (input, (destination, wide)) = parse_6bits_and_flags(input, opcode)?;
-        (input, destination, wide)
-    };
-
-    // Second byte
-    let (input, (mode, reg, rm)) = parse_mod_reg_rm_byte(input, wide)?;
-
-    let (input, rm) = parse_rm(input, &mode, wide, rm, segment)?;
-    if destination {
-        Ok((
-            input,
-            Instr::BinaryInstr {
-                op,
-                dst: RM::Reg(reg),
-                src: rm,
-            },
-        ))
-    } else {
-        Ok((
-            input,
-            Instr::BinaryInstr {
-                op,
-                dst: rm.try_into().unwrap(),
-                src: RM::Reg(reg),
-            },
-        ))
+        self.segment = None;
+        rm
     }
-}
 
-fn parse_load(input: &[u8], opcode: u8, op: BinaryOp) -> IResult<&[u8], Instr> {
-    let (input, _) = tag_bytes([opcode])(input)?;
-    let (input, (mode, reg, rm)) = parse_mod_reg_rm_byte(input, true)?;
-    let (input, rm) = parse_rm(input, &mode, true, rm, None)?;
-    Ok((
-        input,
-        Instr::BinaryInstr {
-            op,
-            dst: RM::Reg(reg),
-            src: rm,
-        },
-    ))
-}
-
-/// Parse immediate to register instructions.
-fn parse_mov_imd_to_reg(input: &[u8]) -> IResult<&[u8], Instr> {
-    let (input, (_, wide, reg)): (&[u8], (u8, bool, u8)) =
-        bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(tuple((
-            tag(0b1011, 4usize),
-            map(take(1usize), |x: u8| x == 1),
-            take(3usize),
-        )))(input)?;
-
-    let (input, imd) = if wide {
-        parse_literal_word(input)?
-    } else {
-        parse_literal_byte(input)?
-    };
-    let instr = Instr::BinaryInstr {
-        op: BinaryOp::Mov,
-        dst: RM::Reg(parse_register(reg, wide)),
-        src: RM::Imd(imd),
-    };
-    Ok((input, instr))
-}
-
-fn parse_imd_to_rm(
-    input: &[u8],
-    opcode1: u8,
-    opcode2: u8,
-    ignore_s: bool, // TODO maybe just need to check if op is MOV?
-    op: BinaryOp,
-) -> IResult<&[u8], Instr> {
-    let (input, segment) = opt(parse_segment_instr)(input)?;
-
-    // First byte
-    let (input, (s, w)) = parse_6bits_and_flags(input, opcode1)?;
-
-    // Second byte
-    let (input, (mode, rm)) = parse_mod_code_rm(input, opcode2)?;
-
-    let (input, rm) = parse_rm(input, &mode, w, rm, segment)?;
-
-    let (input, data) = if w && (ignore_s || !s) {
-        let (input, literal) = parse_literal_word(input)?;
-        (input, literal)
-    } else {
-        let (input, mut literal) = parse_literal_byte(input)?;
-        if w {
-            literal = literal.as_word();
+    fn parse_literal(&mut self, wide: bool) -> anyhow::Result<Literal> {
+        if wide {
+            let (rest, literal) = parse_literal_word(self.bits);
+            self.bits = rest;
+            Ok(literal)
+        } else {
+            let (rest, literal) = parse_literal_byte(self.bits);
+            self.bits = rest;
+            Ok(literal)
         }
-        (input, literal)
-    };
-
-    Ok((
-        input,
-        Instr::BinaryInstr {
-            op,
-            dst: rm.try_into().unwrap(),
-            src: RM::Imd(data),
-        },
-    ))
-}
-
-/// Helper for extracting similar accumulator-style MOVs.
-fn parse_accum_style(
-    input: &[u8],
-    code: u8,
-    destination: bool,
-    op: BinaryOp,
-) -> IResult<&[u8], Instr> {
-    // First byte
-    let (input, wide) = parse_7bits_and_flag(input, code)?;
-
-    let (input, data) = if wide {
-        parse_literal_word(input)?
-    } else {
-        parse_literal_byte(input)?
-    };
-    let reg = if wide { Register::AX } else { Register::AL };
-    match (destination, &op) {
-        (true, BinaryOp::Mov) => Ok((
-            input,
-            Instr::BinaryInstr {
-                op,
-                dst: RM::Reg(reg),
-                src: RM::Mem(MemAddr::new(None, None, None, Some(data))),
-            },
-        )),
-        (false, BinaryOp::Mov) => Ok((
-            input,
-            Instr::BinaryInstr {
-                op,
-                dst: RM::Mem(MemAddr::new(None, None, None, Some(data))),
-                src: RM::Reg(reg),
-            },
-        )),
-        _ => Ok((
-            input,
-            Instr::BinaryInstr {
-                op,
-                dst: RM::Reg(reg),
-                src: RM::Imd(data),
-            },
-        )),
     }
-}
 
-// TODO very similar to `parse_unary_reg`.
-fn parse_accum_reg(input: &[u8], opcode: u8, op: BinaryOp) -> IResult<&[u8], Instr> {
-    let (input, reg) = parse_code_register(input, opcode)?;
-    Ok((
-        input,
-        Instr::BinaryInstr {
-            op,
-            dst: RM::Reg(Register::AX),
-            src: RM::Reg(reg),
-        },
-    ))
+    fn parse_byte_offset(&mut self) -> anyhow::Result<Offset> {
+        let (inc, rest) = self.bits.split_at(8);
+        self.bits = rest;
+        Ok(Offset::Byte(inc.load::<i8>()))
+    }
+
+    fn intermediate_to_instr(
+        &mut self,
+        intermediate: IntermediateInstr,
+    ) -> anyhow::Result<Option<Instr>> {
+        if let Ok(op) = NullaryOp::from_str(&intermediate.mnemonic) {
+            Ok(Some(Instr::NullaryInstr { op }))
+        } else if let Ok(op) = UnaryOp::from_str(&intermediate.mnemonic) {
+            Ok(Some(self.disassemble_unary_op(op, &intermediate)?))
+        } else if let Ok(op) = BinaryOp::from_str(&intermediate.mnemonic) {
+            Ok(Some(self.disassemble_binary_op(op, &intermediate)?))
+        } else if let Ok(op) = JumpOp::from_str(&intermediate.mnemonic) {
+            let offset = self.parse_byte_offset()?;
+            let instr = Instr::JumpInstr { op, offset };
+            Ok(Some(instr))
+        } else if let Some((op, rm, mm, v, w)) = (
+            ShiftRotOp::from_str(&intermediate.mnemonic).ok(),
+            intermediate.rm,
+            intermediate.mm,
+            intermediate.v,
+            intermediate.w,
+        )
+            .zip()
+        {
+            let rm = self.parse_rm(rm, mm, Some(w))?;
+            let src = if v {
+                ShiftRotSrc::RM(RM::Reg(Register::CL))
+            } else {
+                ShiftRotSrc::One
+            };
+            let instr = Instr::ShiftRotInstr {
+                op,
+                dst: rm,
+                src,
+                wide: w,
+            };
+            Ok(Some(instr))
+        } else if let Ok(op) = ModifierOp::from_str(&intermediate.mnemonic) {
+            let op = match op {
+                ModifierOp::Rep(_) => intermediate
+                    .z
+                    .map(ModifierOp::Rep)
+                    .ok_or_else(|| anyhow!("need a Z flag specified for REP op")),
+                _ => Ok(op),
+            }?;
+            self.modifier = Some(op);
+            Ok(None)
+        } else if let Ok(op) = ControlXferOp::from_str(&intermediate.mnemonic) {
+            let code = intermediate.code.load::<u8>();
+            let value = match code {
+                0b11000010 | 0b11001101 | 0b11001010 => {
+                    let imd = self.parse_literal(code != 0b11001101)?;
+                    Some(imd)
+                }
+                _ => None,
+            };
+            Ok(Some(Instr::ControlXferInstr { op, value }))
+        } else {
+            Err(anyhow!("{}", intermediate.mnemonic))
+        }
+    }
+
+    fn disassemble_unary_op(
+        &mut self,
+        op: UnaryOp,
+        intermediate: &IntermediateInstr,
+    ) -> anyhow::Result<Instr> {
+        let (dst, wide) =
+            if let Some((rm, mm, w)) = (intermediate.rm, intermediate.mm, intermediate.w).zip() {
+                let rm = self.parse_rm(rm, mm, Some(w))?;
+                Ok((UnaryDest::RM(rm), Some(w)))
+            } else if let Some(reg) = intermediate.reg {
+                let reg = parse_register(reg, true)?;
+                Ok((UnaryDest::RM(RM::Reg(reg)), None))
+            } else if let Some(sr) = intermediate.sr {
+                let segreg = parse_segment(sr)?;
+                Ok((UnaryDest::RM(RM::SegReg(segreg)), None))
+            } else if let Some((start, end)) = intermediate.start.zip(intermediate.end) {
+                Ok((UnaryDest::InterSeg((start, end)), None))
+            } else if let Some(offset) = intermediate.offset {
+                Ok((UnaryDest::Offset(offset), None))
+            } else {
+                Err(anyhow!("unhandled unary instr: {:?}", intermediate))
+            }?;
+        Ok(Instr::UnaryInstr { op, dst, wide })
+    }
+
+    fn disassemble_binary_op(
+        &mut self,
+        op: BinaryOp,
+        intermediate: &IntermediateInstr,
+    ) -> anyhow::Result<Instr> {
+        let (dst, src) = if let Some((rm, mm)) = intermediate.rm.zip(intermediate.mm) {
+            let rm = self.parse_rm(rm, mm, intermediate.w)?;
+            if let Some((reg, w)) = intermediate.reg.zip(intermediate.w) {
+                let reg = parse_register(reg, w)?;
+                let d = intermediate
+                    .d
+                    // Special cases where `d` is implied.
+                    .unwrap_or(!matches!(op, BinaryOp::Test));
+                if d {
+                    Ok((RM::Reg(reg), rm))
+                } else {
+                    Ok((rm, RM::Reg(reg)))
+                }
+            } else if let Some(sr) = intermediate.sr {
+                let segreg = RM::SegReg(parse_segment(sr)?);
+                if intermediate.code.load::<u8>() == 0b10001100 {
+                    // Weird one-off for MOV
+                    Ok((rm, segreg))
+                } else {
+                    Ok((segreg, rm))
+                }
+            } else if let Some(reg) = intermediate.reg {
+                let reg = parse_register(reg, true)?;
+                Ok((RM::Reg(reg), rm))
+            } else if let (Some(w), true) = (
+                intermediate.w,
+                intermediate.s.is_some() || matches!(op, BinaryOp::Mov),
+            ) {
+                let s = intermediate.s.unwrap_or(false);
+                let data = if w && !s {
+                    self.parse_literal(true)?
+                } else {
+                    let mut literal = self.parse_literal(false)?;
+                    if w {
+                        literal = literal.as_word();
+                    }
+                    literal
+                };
+                Ok((rm, RM::Imd(data)))
+            } else {
+                Err(anyhow!("unhandled binary instr: {:?}", intermediate))
+            }
+        } else if let Some(w) = intermediate.w {
+            if let Some(reg) = intermediate.reg {
+                let reg = parse_register(reg, w)?;
+                let imd = self.parse_literal(w)?;
+                Ok((RM::Reg(reg), RM::Imd(imd)))
+            } else {
+                // When only W present, there are more "special case" treatments
+                // that can only really be determined by looking at the prefix.
+                let reg = if w { Register::AX } else { Register::AL };
+                let code = intermediate.code.load::<u8>();
+                match code {
+                    0b1110010 | 0b1110011 => {
+                        let data = self.parse_literal(false)?;
+                        if matches!(op, BinaryOp::In) {
+                            Ok((RM::Reg(reg), RM::Imd(data)))
+                        } else {
+                            Ok((RM::Imd(data), RM::Reg(reg)))
+                        }
+                    }
+                    0b1110110 | 0b1110111 => {
+                        if matches!(op, BinaryOp::In) {
+                            Ok((RM::Reg(reg), RM::Reg(Register::DX)))
+                        } else {
+                            Ok((RM::Reg(Register::DX), RM::Reg(reg)))
+                        }
+                    }
+                    0b1010000 | 0b1010001 => {
+                        let data = self.parse_literal(w)?;
+                        if code == 0b1010001 {
+                            Ok((
+                                RM::Mem(MemAddr::new(None, None, None, Some(data))),
+                                RM::Reg(reg),
+                            ))
+                        } else {
+                            Ok((
+                                RM::Reg(reg),
+                                RM::Mem(MemAddr::new(None, None, None, Some(data))),
+                            ))
+                        }
+                    }
+                    _ => {
+                        let data = self.parse_literal(w)?;
+                        Ok((RM::Reg(reg), RM::Imd(data)))
+                    }
+                }
+            }
+        } else if let (Some(reg), true) = (intermediate.reg, matches!(op, BinaryOp::Xchg)) {
+            // Special case for XCHG
+            let reg = parse_register(reg, true)?;
+            Ok((RM::Reg(Register::AX), RM::Reg(reg)))
+        } else {
+            Err(anyhow!("unhandled unary instr: {:?}", intermediate))
+        }?;
+        Ok(Instr::BinaryInstr { op, dst, src })
+    }
 }
 
 /// Parse the single next byte as a "literal."
-fn parse_literal_byte(input: &[u8]) -> IResult<&[u8], Literal> {
-    map(take_bytes(1usize), |x: &[u8]| Literal::Byte(x[0] as i8))(input)
+fn parse_literal_byte(bits: &BitS) -> (&BitS, Literal) {
+    let (head, tail) = bits.split_at(8);
+    (tail, Literal::Byte(head.load()))
 }
 
-fn parse_word(input: &[u8]) -> IResult<&[u8], u16> {
-    map(take_bytes(2usize), |x: &[u8]| {
-        (x[1] as u16) << 8 | (x[0] as u16)
-    })(input)
+fn parse_literal_word(bits: &BitS) -> (&BitS, Literal) {
+    let (head, tail) = bits.split_at(16);
+    (tail, Literal::Word(head.load()))
 }
 
-/// Parse the next two bytes as a "literal."
-fn parse_literal_word(input: &[u8]) -> IResult<&[u8], Literal> {
-    map(parse_word, |x: u16| Literal::Word(x))(input)
+fn parse_offset_byte(bits: &BitS) -> (&BitS, Offset) {
+    let (head, tail) = bits.split_at(8);
+    (tail, Offset::Byte(head.load::<i8>()))
+}
+
+fn parse_offset_word(bits: &BitS) -> (&BitS, Offset) {
+    let (head, tail) = bits.split_at(16);
+    (tail, Offset::Word(head.load::<i16>()))
+}
+
+fn parse_mod_mode(mm: u8) -> anyhow::Result<MovMode> {
+    CODE_TO_MOD_MODE
+        .get(&mm)
+        .copied()
+        .ok_or_else(|| anyhow!("invalid input code"))
+}
+
+/// Match a byte `code` to a `Register`.
+fn parse_register(code: u8, wide: bool) -> anyhow::Result<Register> {
+    if wide {
+        CODE_TO_REGISTER_WIDE
+            .get(&code)
+            .copied()
+            .ok_or_else(|| anyhow!("Unexpected register code {:?}", code))
+    } else {
+        CODE_TO_REGISTER
+            .get(&code)
+            .copied()
+            .ok_or_else(|| anyhow!("Unexpected register code {:?}", code))
+    }
 }
 
 fn parse_effective_address(
@@ -573,291 +648,94 @@ fn parse_effective_address(
     code: u8,
     disp: Option<Literal>,
     segment: Option<Segment>,
-) -> MemAddr {
-    match code {
-        0b000 => MemAddr::new(segment, Some(Register::BX), Some(Register::SI), disp),
-        0b001 => MemAddr::new(segment, Some(Register::BX), Some(Register::DI), disp),
-        0b010 => MemAddr::new(segment, Some(Register::BP), Some(Register::SI), disp),
-        0b011 => MemAddr::new(segment, Some(Register::BP), Some(Register::DI), disp),
-        0b100 => MemAddr::new(segment, Some(Register::SI), None, disp),
-        0b101 => MemAddr::new(segment, Some(Register::DI), None, disp),
+) -> anyhow::Result<MemAddr> {
+    let (reg1, reg2) = match code {
+        0b000 => Ok((Some(Register::BX), Some(Register::SI))),
+        0b001 => Ok((Some(Register::BX), Some(Register::DI))),
+        0b010 => Ok((Some(Register::BP), Some(Register::SI))),
+        0b011 => Ok((Some(Register::BP), Some(Register::DI))),
+        0b100 => Ok((Some(Register::SI), None)),
+        0b101 => Ok((Some(Register::DI), None)),
         0b110 => match mode {
-            MovMode::MemMode(None) => MemAddr::new(segment, None, None, disp),
-            _ => MemAddr::new(segment, Some(Register::BP), None, disp),
+            MovMode::MemMode(None) => Ok((None, None)),
+            _ => Ok((Some(Register::BP), None)),
         },
-        0b111 => MemAddr::new(segment, Some(Register::BX), None, disp),
-        _ => panic!("invalid input code"),
+        0b111 => Ok((Some(Register::BX), None)),
+        _ => Err(anyhow!("invalid input code")),
+    }?;
+    Ok(MemAddr::new(segment, reg1, reg2, disp))
+}
+
+fn parse_segment(code: u8) -> anyhow::Result<Segment> {
+    CODE_TO_SEGMENT
+        .get(&code)
+        .copied()
+        .ok_or_else(|| anyhow!("Unexpected segment code {:?}", code))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    lazy_static! {
+        static ref PUSH: Spec = Spec {
+            mnemonic: "PUSH".to_string(),
+            code: bitvec![u8, Msb0; 1, 1, 1, 1, 1, 1, 1],
+            rest: vec![
+                InstructionPart::W,
+                InstructionPart::MOD,
+                InstructionPart::Literal(bitvec![u8, Msb0; 1, 1, 0]),
+                InstructionPart::RM,
+            ],
+        };
     }
-}
 
-fn parse_rm<'a, 'b>(
-    input: &'a [u8],
-    mode: &'b MovMode,
-    wide: bool,
-    rm: u8,
-    segment: Option<Segment>,
-) -> IResult<&'a [u8], RM> {
-    match mode {
-        MovMode::MemMode(disp) => {
-            let (input, disp) = match disp {
-                None => {
-                    if rm == 0b110 {
-                        let (input, literal) = parse_literal_word(input)?;
-                        (input, Some(literal))
-                    } else {
-                        (input, None)
-                    }
-                }
-                Some(Displacement::D8) => {
-                    let (input, literal) = parse_literal_byte(input)?;
-                    (input, Some(literal))
-                }
-                Some(Displacement::D16) => {
-                    let (input, literal) = parse_literal_word(input)?;
-                    (input, Some(literal))
-                }
-            };
-            let mem_addr = parse_effective_address(mode, rm, disp, segment);
-            Ok((input, RM::Mem(mem_addr)))
-        }
-        MovMode::RegMode => {
-            let register = parse_register(rm, wide);
-            Ok((input, RM::Reg(register)))
-        }
+    #[test]
+    fn test_generate_combinations() {
+        let fields = vec![
+            BitSchemaPart::Fixed(bitvec![u8, Msb0; 1]),
+            BitSchemaPart::Variable(2),
+            BitSchemaPart::Fixed(bitvec![u8, Msb0; 1]),
+        ];
+        assert_eq!(
+            HashSet::<BitV>::from_iter(generate_combinations(&fields).iter().cloned()),
+            HashSet::<BitV>::from_iter(
+                [
+                    bitvec![u8, Msb0; 1, 0, 0, 1],
+                    bitvec![u8, Msb0; 1, 0, 1, 1],
+                    bitvec![u8, Msb0; 1, 1, 0, 1],
+                    bitvec![u8, Msb0; 1, 1, 1, 1]
+                ]
+                .iter()
+                .cloned()
+            )
+        );
     }
-}
 
-fn parse_jump_instr(input: &[u8], opcode: u8, op: JumpOp) -> IResult<&[u8], Instr> {
-    let (input, _) = tag_bytes([opcode])(input)?;
-    let (input, inc) = take_bytes(1usize)(input)?;
-    Ok((
-        input,
-        Instr::JumpInstr {
-            op,
-            offset: Offset::Byte(inc[0] as i8),
-        },
-    ))
-}
-
-fn parse_unary_rm(input: &[u8], opcode1: u8, opcode2: u8, op: UnaryOp) -> IResult<&[u8], Instr> {
-    let (input, segment) = opt(parse_segment_instr)(input)?;
-    let (input, w) = parse_7bits_and_flag(input, opcode1)?;
-    let (input, (mode, rm)) = parse_mod_code_rm(input, opcode2)?;
-    let (input, rm) = parse_rm(input, &mode, w, rm, segment)?;
-
-    Ok((
-        input,
-        Instr::UnaryInstr {
-            op,
-            dst: UnaryDest::RM(rm),
-            wide: Some(w),
-        },
-    ))
-}
-
-fn parse_unary_reg(input: &[u8], opcode: u8, op: UnaryOp) -> IResult<&[u8], Instr> {
-    let (input, reg) = parse_code_register(input, opcode)?;
-    Ok((
-        input,
-        Instr::UnaryInstr {
-            op,
-            dst: UnaryDest::RM(RM::Reg(reg)),
-            wide: None,
-        },
-    ))
-}
-
-fn parse_unary_segreg(
-    input: &[u8],
-    opcode1: u8,
-    opcode2: u8,
-    op: UnaryOp,
-) -> IResult<&[u8], Instr> {
-    let (input, segreg) = parse_code_segment(input, opcode1, opcode2)?;
-    Ok((
-        input,
-        Instr::UnaryInstr {
-            op,
-            dst: UnaryDest::RM(RM::SegReg(segreg)),
-            wide: None,
-        },
-    ))
-}
-
-// TODO these next two are quite similar...
-fn parse_fixed_port(
-    input: &[u8],
-    opcode: u8,
-    destination: bool,
-    op: BinaryOp,
-) -> IResult<&[u8], Instr> {
-    let (input, wide) = parse_7bits_and_flag(input, opcode)?;
-    let (input, data) = parse_literal_byte(input)?;
-    let reg = if wide { Register::AX } else { Register::AL };
-
-    let instr = if destination {
-        Instr::BinaryInstr {
-            op,
-            dst: RM::Reg(reg),
-            src: RM::Imd(data),
-        }
-    } else {
-        Instr::BinaryInstr {
-            op,
-            dst: RM::Imd(data),
-            src: RM::Reg(reg),
-        }
-    };
-    Ok((input, instr))
-}
-
-fn parse_variable_port(
-    input: &[u8],
-    opcode: u8,
-    destination: bool,
-    op: BinaryOp,
-) -> IResult<&[u8], Instr> {
-    let (input, wide) = parse_7bits_and_flag(input, opcode)?;
-    let reg = if wide {
-        RM::Reg(Register::AX)
-    } else {
-        RM::Reg(Register::AL)
-    };
-    let instr = if destination {
-        Instr::BinaryInstr {
-            op,
-            dst: reg,
-            src: RM::Reg(Register::DX),
-        }
-    } else {
-        Instr::BinaryInstr {
-            op,
-            dst: RM::Reg(Register::DX),
-            src: reg,
-        }
-    };
-    Ok((input, instr))
-}
-
-fn parse_shift_rotate(
-    input: &[u8],
-    opcode1: u8,
-    opcode2: u8,
-    op: ShiftRotOp,
-) -> IResult<&[u8], Instr> {
-    let (input, (v, wide)) = parse_6bits_and_flags(input, opcode1)?;
-    let (input, (mode, rm)) = parse_mod_code_rm(input, opcode2)?;
-    let (input, rm) = parse_rm(input, &mode, wide, rm, None)?;
-    let src = if v {
-        ShiftRotSrc::RM(RM::Reg(Register::CL))
-    } else {
-        ShiftRotSrc::One
-    };
-    let instr = Instr::ShiftRotInstr {
-        op,
-        dst: rm.try_into().unwrap(),
-        src,
-        wide,
-    };
-    Ok((input, instr))
-}
-
-fn parse_repeat_instr(input: &[u8], opcode: u8, op: ModifierOp) -> IResult<&[u8], Instr> {
-    let (input, _z) = parse_7bits_and_flag(input, opcode)?;
-    let (input, instr) = parse_instr(input)?;
-    let instr = Instr::ModifierInstr {
-        op,
-        instr: Box::new(instr),
-    };
-    Ok((input, instr))
-}
-
-fn parse_control_xfer_nullary_op(
-    input: &[u8],
-    opcode: u8,
-    op: ControlXferOp,
-) -> IResult<&[u8], Instr> {
-    let (input, _) = tag_bytes([opcode])(input)?;
-    Ok((input, Instr::ControlXferInstr { op, value: None }))
-}
-
-fn parse_control_xfer(
-    input: &[u8],
-    opcode: u8,
-    op: ControlXferOp,
-    wide: bool,
-) -> IResult<&[u8], Instr> {
-    let (input, _) = tag_bytes([opcode])(input)?;
-    let (input, imd) = if wide {
-        parse_literal_word(input)?
-    } else {
-        parse_literal_byte(input)?
-    };
-    Ok((
-        input,
-        Instr::ControlXferInstr {
-            op,
-            value: Some(imd),
-        },
-    ))
-}
-
-fn parse_unary_interseg(input: &[u8], opcode: u8, op: UnaryOp) -> IResult<&[u8], Instr> {
-    let (input, _) = tag_bytes([opcode])(input)?;
-    let (input, end) = parse_literal_word(input)?;
-    let (input, start) = parse_literal_word(input)?;
-    let instr = Instr::UnaryInstr {
-        op,
-        dst: UnaryDest::InterSeg((start, end)),
-        wide: None,
-    };
-    Ok((input, instr))
-}
-
-fn parse_binary_segreg(
-    input: &[u8],
-    opcode: u8,
-    dest: bool,
-    op: BinaryOp,
-) -> IResult<&[u8], Instr> {
-    let (input, _) = tag_bytes([opcode])(input)?;
-    let (input, (mode, _, segreg, rm)): (&[u8], (MovMode, u8, Segment, u8)) =
-        bits::<_, _, nom::error::Error<(&[u8], usize)>, _, _>(tuple((
-            map(take(2usize), |code: u8| code.into()),
-            tag(0b0, 1usize),
-            map(take(2usize), |code: u8| parse_segment(code)),
-            take(3usize),
-        )))(input)?;
-
-    let (input, rm) = parse_rm(input, &mode, true, rm, None)?;
-    if dest {
-        Ok((
-            input,
-            Instr::BinaryInstr {
-                op,
-                dst: RM::SegReg(segreg),
-                src: rm,
-            },
-        ))
-    } else {
-        Ok((
-            input,
-            Instr::BinaryInstr {
-                op,
-                dst: rm.try_into().unwrap(),
-                src: RM::SegReg(segreg),
-            },
-        ))
+    #[test]
+    fn test_try_spec() {
+        let bits = bits![u8, Msb0; 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1];
+        let mut disassembler = Disassembler::new(bits);
+        let intermediate = disassembler.try_spec(&PUSH).unwrap().unwrap();
+        assert_eq!(intermediate.mnemonic, "PUSH");
+        assert!(intermediate.w.unwrap());
+        assert_eq!(intermediate.rm.unwrap(), 0b111);
+        assert_eq!(intermediate.mm.unwrap(), 0b11);
     }
-}
 
-fn parse_unary_offset(input: &[u8], opcode: u8, op: UnaryOp) -> IResult<&[u8], Instr> {
-    let (input, _) = tag_bytes([opcode])(input)?;
-    let (input, offset) = parse_word(input)?;
-    let instr = Instr::UnaryInstr {
-        op,
-        dst: UnaryDest::Offset(Offset::Word(offset as i16)),
-        wide: None,
-    };
-    Ok((input, instr))
+    #[test]
+    fn test_parse_mod_mode() {
+        assert_eq!(parse_mod_mode(0b00).unwrap(), MovMode::MemMode(None));
+        assert_eq!(
+            parse_mod_mode(0b01).unwrap(),
+            MovMode::MemMode(Some(Displacement::D8))
+        );
+        assert_eq!(
+            parse_mod_mode(0b10).unwrap(),
+            MovMode::MemMode(Some(Displacement::D16))
+        );
+        assert_eq!(parse_mod_mode(0b11).unwrap(), MovMode::RegMode);
+    }
 }

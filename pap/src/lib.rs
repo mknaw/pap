@@ -3,8 +3,8 @@ extern crate lazy_static;
 
 pub mod common;
 mod disassembler;
+pub(crate) mod dsl;
 mod simulator;
-pub(crate) mod utils;
 
 pub use disassembler::disassemble;
 pub use simulator::simulate;

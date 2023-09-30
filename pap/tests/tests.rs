@@ -5,7 +5,7 @@ use std::process::Command;
 
 use tempfile::{tempdir, TempDir};
 
-use pap::disassemble;
+use pap::{disassemble, simulate, Instr, RegisterState};
 
 /// Run `nasm` on the given file and return the path to the assembled file.
 fn assemble(path: &Path, dir: &TempDir) -> PathBuf {
@@ -27,15 +27,20 @@ fn format_octets(bytes: &[u8]) -> String {
         .join(" ")
 }
 
-/// Assemble `target`, then run disassembler, assemble that, and compare the two assembled files.
-/// Running these tests requires available `nasm` command!
-fn test_disassemble(target: &Path) {
+fn parse_instrs(path: &PathBuf) -> (TempDir, PathBuf, Vec<Instr>) {
+    let path = Path::new(path);
     let dir = tempdir().unwrap();
-    let assembled = assemble(target, &dir);
+    let assembled = assemble(path, &dir);
     let data = std::fs::read(&assembled).unwrap();
     let input = data.as_slice();
+    let instrs = disassemble(input).unwrap_or_else(|e| panic!("{:?}", e));
+    (dir, assembled, instrs)
+}
 
-    let disassembled = disassemble(input).unwrap_or_else(|e| panic!("{:?}", e));
+/// Assemble `target`, then run disassembler, assemble that, and compare the two assembled files.
+/// Running these tests requires available `nasm` command!
+fn test_disassemble(target: &PathBuf) {
+    let (dir, assembled, disassembled) = parse_instrs(target);
 
     let disassembled_path = dir.path().join("instructions.asm");
     let mut disassembled_file = File::create(&disassembled_path).unwrap();
@@ -62,37 +67,58 @@ fn test_disassemble(target: &Path) {
         format_octets(&original),
         format_octets(&reassembled),
         "\n\nExpected:\n{}//\n\nActual:\n{}",
-        std::str::from_utf8(&read(target).unwrap()).unwrap(),
+        std::str::from_utf8(&read(Path::new(target)).unwrap()).unwrap(),
         std::fs::read_to_string(&disassembled_path).unwrap()
     );
 }
 
+// Disassembly tests
+
 #[test]
-fn test_disassemble_listing_38() {
-    test_disassemble(Path::new("./assets/listing_38.asm"));
+fn test_disassemble_cases() {
+    let cases = std::fs::read_dir("./tests/cases/").unwrap();
+
+    for path in cases {
+        test_disassemble(&path.unwrap().path());
+    }
+}
+
+// Simulator tests
+
+#[test]
+fn test_simulate_listing_43() {
+    let (_, _, instrs) = parse_instrs(&Path::new("./tests/cases/listing_43.asm").to_path_buf());
+    let state = simulate(&instrs);
+    assert_eq!(
+        state,
+        RegisterState {
+            ax: 1,
+            bx: 2,
+            cx: 3,
+            dx: 4,
+            sp: 5,
+            bp: 6,
+            si: 7,
+            di: 8,
+        }
+    )
 }
 
 #[test]
-fn test_disassemble_listing_39() {
-    test_disassemble(Path::new("./assets/listing_39.asm"));
-}
-
-#[test]
-fn test_disassemble_listing_40() {
-    test_disassemble(Path::new("./assets/listing_40.asm"));
-}
-
-#[test]
-fn test_disassemble_listing_41() {
-    test_disassemble(Path::new("./assets/listing_41.asm"));
-}
-
-#[test]
-fn test_disassemble_listing_42() {
-    test_disassemble(Path::new("./assets/listing_42.asm"));
-}
-
-#[test]
-fn test_disassemble_listing_43() {
-    test_disassemble(Path::new("./assets/listing_43.asm"));
+fn test_simulate_listing_44() {
+    let (_, _, instrs) = parse_instrs(&Path::new("./tests/cases/listing_44.asm").to_path_buf());
+    let state = simulate(&instrs);
+    assert_eq!(
+        state,
+        RegisterState {
+            ax: 4,
+            bx: 3,
+            cx: 2,
+            dx: 1,
+            sp: 1,
+            bp: 2,
+            si: 3,
+            di: 4,
+        }
+    )
 }

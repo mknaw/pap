@@ -2,18 +2,19 @@ use std::fmt::{self, Display};
 
 use crate::common::*;
 
-pub struct State {
-    ax: u16,
-    bx: u16,
-    cx: u16,
-    dx: u16,
-    sp: u16,
-    bp: u16,
-    si: u16,
-    di: u16,
+#[derive(Debug, Eq, PartialEq)]
+pub struct RegisterState {
+    pub ax: u16,
+    pub bx: u16,
+    pub cx: u16,
+    pub dx: u16,
+    pub sp: u16,
+    pub bp: u16,
+    pub si: u16,
+    pub di: u16,
 }
 
-impl State {
+impl RegisterState {
     fn new() -> Self {
         Self {
             ax: 0,
@@ -28,7 +29,7 @@ impl State {
     }
 }
 
-impl Display for State {
+impl Display for RegisterState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "AX: 0x{:04X}", self.ax)?;
         writeln!(f, "BX: 0x{:04X}", self.bx)?;
@@ -42,15 +43,15 @@ impl Display for State {
     }
 }
 
-pub fn simulate(instrs: &Vec<Instr>) -> State {
-    let mut state = State::new();
+pub fn simulate(instrs: &Vec<Instr>) -> RegisterState {
+    let mut state = RegisterState::new();
     for instr in instrs {
         apply(&mut state, instr);
     }
     state
 }
 
-fn apply(state: &mut State, instr: &Instr) {
+fn apply(state: &mut RegisterState, instr: &Instr) {
     match instr {
         Instr::BinaryInstr { op, dst, src } => match op {
             BinaryOp::Mov => {
@@ -64,7 +65,7 @@ fn apply(state: &mut State, instr: &Instr) {
     }
 }
 
-fn apply_mov(state: &mut State, dst: &RM, src: &RM) {
+fn apply_mov(state: &mut RegisterState, dst: &RM, src: &RM) {
     let value = match src {
         RM::Reg(r) => match r {
             Register::AX => state.ax,

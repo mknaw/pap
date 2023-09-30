@@ -6,5 +6,6 @@ mod disassembler;
 pub(crate) mod dsl;
 mod simulator;
 
+pub use common::Instr;
 pub use disassembler::disassemble;
-pub use simulator::simulate;
+pub use simulator::{simulate, RegisterState};

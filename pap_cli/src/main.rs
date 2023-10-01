@@ -2,7 +2,6 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-
 use pap::{disassemble, simulate};
 
 #[derive(Parser)]

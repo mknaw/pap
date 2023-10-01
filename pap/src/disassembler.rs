@@ -4,10 +4,8 @@ use std::str::FromStr;
 use anyhow::anyhow;
 use bitvec::prelude::*;
 
-use crate::{
-    common::*,
-    dsl::{construct_instruction_set, InstructionPart, Spec},
-};
+use crate::common::*;
+use crate::dsl::{construct_instruction_set, InstructionPart, Spec};
 
 type BitV = BitVec<u8, Msb0>;
 type BitS = BitSlice<u8, Msb0>;
@@ -380,13 +378,11 @@ impl<'a> Disassembler<'a> {
                 self.bits = rest;
                 Ok(RM::Mem(mem_addr))
             }
-            MovMode::RegMode => match wide {
-                Some(w) => {
-                    let register = parse_register(rm, w)?;
-                    Ok(RM::Reg(register))
-                }
-                _ => anyhow::bail!("need non-None `wide` for register mode"),
-            },
+            MovMode::RegMode => {
+                let w = wide.unwrap_or(true);
+                let register = parse_register(rm, w)?;
+                Ok(RM::Reg(register))
+            }
         };
         self.segment = None;
         rm

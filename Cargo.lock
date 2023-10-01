@@ -288,6 +288,7 @@ dependencies = [
  "strum",
  "strum_macros",
  "tempfile",
+ "test_macros",
 ]
 
 [[package]]
@@ -418,6 +419,15 @@ dependencies = [
  "redox_syscall",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "test_macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]

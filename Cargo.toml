@@ -1,5 +1,6 @@
 [workspace]
 members = [
     "pap",
-    "pap_cli"
+    "pap_cli",
+    "test_macros"
 ]

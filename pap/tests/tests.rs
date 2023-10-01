@@ -3,9 +3,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use tempfile::{tempdir, TempDir};
-
 use pap::{disassemble, simulate, Instr, RegisterState};
+use tempfile::{tempdir, TempDir};
+use test_macros::generate_disassembler_tests;
 
 /// Run `nasm` on the given file and return the path to the assembled file.
 fn assemble(path: &Path, dir: &TempDir) -> PathBuf {
@@ -74,19 +74,12 @@ fn test_disassemble(target: &PathBuf) {
 
 // Disassembly tests
 
-#[test]
-fn test_disassemble_cases() {
-    let cases = std::fs::read_dir("./tests/cases/").unwrap();
-
-    for path in cases {
-        test_disassemble(&path.unwrap().path());
-    }
-}
+generate_disassembler_tests!();
 
 // Simulator tests
 
 #[test]
-fn test_simulate_listing_43() {
+fn simulate_listing_43() {
     let (_, _, instrs) = parse_instrs(&Path::new("./tests/cases/listing_43.asm").to_path_buf());
     let state = simulate(&instrs);
     assert_eq!(
@@ -100,12 +93,16 @@ fn test_simulate_listing_43() {
             bp: 6,
             si: 7,
             di: 8,
+            cs: 0,
+            ds: 0,
+            es: 0,
+            ss: 0,
         }
     )
 }
 
 #[test]
-fn test_simulate_listing_44() {
+fn simulate_listing_44() {
     let (_, _, instrs) = parse_instrs(&Path::new("./tests/cases/listing_44.asm").to_path_buf());
     let state = simulate(&instrs);
     assert_eq!(
@@ -119,6 +116,33 @@ fn test_simulate_listing_44() {
             bp: 2,
             si: 3,
             di: 4,
+            cs: 0,
+            ds: 0,
+            es: 0,
+            ss: 0,
+        }
+    )
+}
+
+#[test]
+fn simulate_listing_45() {
+    let (_, _, instrs) = parse_instrs(&Path::new("./tests/cases/listing_45.asm").to_path_buf());
+    let state = simulate(&instrs);
+    assert_eq!(
+        state,
+        RegisterState {
+            ax: 0x4411,
+            bx: 0x3344,
+            cx: 0x6677,
+            dx: 0x7788,
+            sp: 0x4411,
+            bp: 0x3344,
+            si: 0x6677,
+            di: 0x7788,
+            cs: 0,
+            es: 0x6677,
+            ss: 0x4411,
+            ds: 0x3344,
         }
     )
 }

@@ -1,17 +1,12 @@
 use std::iter;
 
 use bitvec::prelude::*;
-
-use nom::character::complete::line_ending;
-use nom::multi::separated_list1;
-use nom::{
-    branch::alt,
-    bytes::complete::tag,
-    character::complete::{alphanumeric1, digit1, multispace0},
-    combinator::map,
-    multi::many0,
-    IResult,
-};
+use nom::branch::alt;
+use nom::bytes::complete::tag;
+use nom::character::complete::{alphanumeric1, digit1, line_ending, multispace0};
+use nom::combinator::map;
+use nom::multi::{many0, separated_list1};
+use nom::IResult;
 
 // TODO name
 #[derive(Debug, PartialEq)]

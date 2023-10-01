@@ -17,3 +17,4 @@ strum_macros = "0.24.3"
 [dev-dependencies]
 itertools = "0.10.5"
 tempfile = "3.5.0"
+test_macros = { path = "../test_macros" }

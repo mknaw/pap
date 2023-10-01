@@ -8,4 +8,4 @@ mod simulator;
 
 pub use common::Instr;
 pub use disassembler::disassemble;
-pub use simulator::{simulate, RegisterState};
+pub use simulator::{simulate, Flags, ProcessorState};

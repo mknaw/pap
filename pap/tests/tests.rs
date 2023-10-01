@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use pap::{disassemble, simulate, Instr, RegisterState};
+use pap::{disassemble, simulate, Flags, Instr, ProcessorState};
 use tempfile::{tempdir, TempDir};
 use test_macros::generate_disassembler_tests;
 
@@ -84,7 +84,7 @@ fn simulate_listing_43() {
     let state = simulate(&instrs);
     assert_eq!(
         state,
-        RegisterState {
+        ProcessorState {
             ax: 1,
             bx: 2,
             cx: 3,
@@ -97,6 +97,7 @@ fn simulate_listing_43() {
             ds: 0,
             es: 0,
             ss: 0,
+            flags: Flags::empty(),
         }
     )
 }
@@ -107,7 +108,7 @@ fn simulate_listing_44() {
     let state = simulate(&instrs);
     assert_eq!(
         state,
-        RegisterState {
+        ProcessorState {
             ax: 4,
             bx: 3,
             cx: 2,
@@ -120,6 +121,7 @@ fn simulate_listing_44() {
             ds: 0,
             es: 0,
             ss: 0,
+            flags: Flags::empty(),
         }
     )
 }
@@ -130,7 +132,7 @@ fn simulate_listing_45() {
     let state = simulate(&instrs);
     assert_eq!(
         state,
-        RegisterState {
+        ProcessorState {
             ax: 0x4411,
             bx: 0x3344,
             cx: 0x6677,
@@ -143,6 +145,31 @@ fn simulate_listing_45() {
             es: 0x6677,
             ss: 0x4411,
             ds: 0x3344,
+            flags: Flags::empty(),
+        }
+    )
+}
+
+#[test]
+fn simulate_listing_46() {
+    let (_, _, instrs) = parse_instrs(&Path::new("./tests/cases/listing_46.asm").to_path_buf());
+    let state = simulate(&instrs);
+    assert_eq!(
+        state,
+        ProcessorState {
+            ax: 0,
+            bx: 0xE102,
+            cx: 0x0F01,
+            dx: 0,
+            sp: 0x03E6,
+            bp: 0,
+            si: 0,
+            di: 0,
+            cs: 0,
+            es: 0,
+            ss: 0,
+            ds: 0,
+            flags: Flags::P | Flags::Z,
         }
     )
 }

@@ -173,3 +173,27 @@ fn simulate_listing_46() {
         }
     )
 }
+
+#[test]
+fn simulate_listing_47() {
+    let (_, _, instrs) = parse_instrs(&Path::new("./tests/cases/listing_47.asm").to_path_buf());
+    let state = simulate(&instrs);
+    assert_eq!(
+        state,
+        ProcessorState {
+            ax: 0,
+            bx: 0x9ca5,
+            cx: 0x0,
+            dx: 0xa,
+            sp: 0x63,
+            bp: 0x62,
+            si: 0,
+            di: 0,
+            cs: 0,
+            es: 0,
+            ss: 0,
+            ds: 0,
+            flags: Flags::C | Flags::P | Flags::A | Flags::S,
+        }
+    )
+}

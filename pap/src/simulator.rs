@@ -7,9 +7,12 @@ use crate::common::*;
 bitflags! {
     #[derive(Debug, Eq, PartialEq)]
     pub struct Flags: u16 {
-        const S = 0b10000000;
-        const Z = 0b01000000;
-        const P = 0b00000100;
+        const O = 0b100000000000;
+        const S = 0b000010000000;
+        const Z = 0b000001000000;
+        const A = 0b000000001000;
+        const P = 0b000000000100;
+        const C = 0b000000000001;
     }
 }
 
@@ -49,27 +52,76 @@ impl ProcessorState {
         }
     }
 
-    fn set_zero(&mut self, value: bool) {
-        if value {
+    fn set_zero(&mut self, value: u16) {
+        if value == 0b0 {
             self.flags |= Flags::Z;
         } else {
             self.flags -= Flags::Z;
         }
     }
 
-    fn set_sign(&mut self, value: bool) {
-        if value {
-            self.flags |= Flags::S;
-        } else {
+    fn set_sign(&mut self, value: u16) {
+        if value & 0x8000 == 0 {
             self.flags -= Flags::S;
+        } else {
+            self.flags |= Flags::S;
         }
     }
 
-    fn set_parity(&mut self, value: bool) {
-        if value {
+    fn set_parity(&mut self, value: u16) {
+        if (value & 0x00FF).count_ones() % 2 == 0 {
             self.flags |= Flags::P;
         } else {
             self.flags -= Flags::P;
+        }
+    }
+
+    fn set_add_overflow(&mut self, lhs: u16, rhs: u16) {
+        if lhs & 0x8000 == 0 && rhs & 0x8000 == 0 && ((lhs + rhs) & 0x8000) != 0 {
+            self.flags |= Flags::O;
+        } else {
+            self.flags -= Flags::O;
+        }
+    }
+
+    fn set_sub_overflow(&mut self, lhs: u16, rhs: u16) {
+        if lhs & 0x8000 != 0 && rhs & 0x8000 == 0 && ((lhs - rhs) & 0x8000) == 0 {
+            self.flags |= Flags::O;
+        } else {
+            self.flags -= Flags::O;
+        }
+    }
+
+    fn set_aux_carry_sub(&mut self, lhs: u16, rhs: u16) {
+        if rhs & 0x000F > lhs & 0x000F {
+            self.flags |= Flags::A;
+        } else {
+            self.flags -= Flags::A;
+        }
+    }
+
+    fn set_aux_carry_add(&mut self, lhs: u16, rhs: u16) {
+        if ((rhs & 0x000F) + (lhs & 0x000F)) > 0x000F {
+            self.flags |= Flags::A;
+        } else {
+            self.flags -= Flags::A;
+        }
+    }
+
+    fn set_carry_add(&mut self, lhs: u16, rhs: u16) {
+        if ((lhs & 0x7FFF) + (rhs & 0x7FFF) > 0x7FFF) && (lhs & 0x8000 == 0 && rhs & 0x8000 == 0) {
+            self.flags |= Flags::C;
+        } else {
+            self.flags -= Flags::C;
+        }
+    }
+
+    fn set_carry_sub(&mut self, lhs: u16, rhs: u16) {
+        // TODO probably should try to implement this myself but tired rn
+        if lhs.checked_sub(rhs).is_none() {
+            self.flags |= Flags::C;
+        } else {
+            self.flags -= Flags::C;
         }
     }
 }
@@ -199,25 +251,41 @@ fn apply_mov(state: &mut ProcessorState, dst: &RM, src: &RM) {
     }
 }
 
-fn arithmetic_side_effect(state: &mut ProcessorState, val: u16) -> u16 {
-    state.set_zero(val == 0);
-    state.set_sign(val & 0x8000 != 0);
-    state.set_parity(val.count_ones() % 2 == 0);
+fn set_standard_flags(state: &mut ProcessorState, val: u16) -> u16 {
+    state.set_zero(val);
+    state.set_parity(val);
+    state.set_sign(val);
     val
+}
+
+fn set_sub_flags(state: &mut ProcessorState, lhs: u16, rhs: u16) -> u16 {
+    let val = lhs.wrapping_sub(rhs);
+    state.set_aux_carry_sub(lhs, rhs);
+    state.set_sub_overflow(lhs, rhs);
+    state.set_carry_sub(lhs, rhs);
+    set_standard_flags(state, val)
+}
+
+fn set_add_flags(state: &mut ProcessorState, lhs: u16, rhs: u16) -> u16 {
+    let val = lhs.wrapping_add(rhs);
+    state.set_aux_carry_add(lhs, rhs);
+    state.set_add_overflow(lhs, rhs);
+    state.set_carry_add(lhs, rhs);
+    set_standard_flags(state, val)
 }
 
 fn apply_sub(state: &mut ProcessorState, dst: &RM, src: &RM) {
     let value = get_value(src, state);
     match dst {
         RM::Reg(r) => match r {
-            Register::AX => state.ax = arithmetic_side_effect(state, state.ax - value),
-            Register::BX => state.bx = arithmetic_side_effect(state, state.bx - value),
-            Register::CX => state.cx = arithmetic_side_effect(state, state.cx - value),
-            Register::DX => state.dx = arithmetic_side_effect(state, state.dx - value),
-            Register::SP => state.sp = arithmetic_side_effect(state, state.sp - value),
-            Register::BP => state.bp = arithmetic_side_effect(state, state.bp - value),
-            Register::SI => state.si = arithmetic_side_effect(state, state.si - value),
-            Register::DI => state.di = arithmetic_side_effect(state, state.di - value),
+            Register::AX => state.ax = set_sub_flags(state, state.ax, value),
+            Register::BX => state.bx = set_sub_flags(state, state.bx, value),
+            Register::CX => state.cx = set_sub_flags(state, state.cx, value),
+            Register::DX => state.dx = set_sub_flags(state, state.dx, value),
+            Register::SP => state.sp = set_sub_flags(state, state.sp, value),
+            Register::BP => state.bp = set_sub_flags(state, state.bp, value),
+            Register::SI => state.si = set_sub_flags(state, state.si, value),
+            Register::DI => state.di = set_sub_flags(state, state.di, value),
             _ => todo!(),
         },
         RM::SegReg(sr) => match sr {
@@ -234,14 +302,14 @@ fn apply_add(state: &mut ProcessorState, dst: &RM, src: &RM) {
     let value = get_value(src, state);
     match dst {
         RM::Reg(r) => match r {
-            Register::AX => state.ax += value,
-            Register::BX => state.bx += value,
-            Register::CX => state.cx += value,
-            Register::DX => state.dx += value,
-            Register::SP => state.sp += value,
-            Register::BP => state.bp += value,
-            Register::SI => state.si += value,
-            Register::DI => state.di += value,
+            Register::AX => state.ax = set_add_flags(state, state.ax, value),
+            Register::BX => state.bx = set_add_flags(state, state.bx, value),
+            Register::CX => state.cx = set_add_flags(state, state.cx, value),
+            Register::DX => state.dx = set_add_flags(state, state.dx, value),
+            Register::SP => state.sp = set_add_flags(state, state.sp, value),
+            Register::BP => state.bp = set_add_flags(state, state.bp, value),
+            Register::SI => state.si = set_add_flags(state, state.si, value),
+            Register::DI => state.di = set_add_flags(state, state.di, value),
             _ => todo!(),
         },
         RM::SegReg(sr) => match sr {
@@ -259,28 +327,28 @@ fn apply_cmp(state: &mut ProcessorState, dst: &RM, src: &RM) {
     match dst {
         RM::Reg(r) => match r {
             Register::AX => {
-                arithmetic_side_effect(state, state.ax - value);
+                set_sub_flags(state, state.ax, value);
             }
             Register::BX => {
-                arithmetic_side_effect(state, state.bx - value);
+                set_sub_flags(state, state.bx, value);
             }
             Register::CX => {
-                arithmetic_side_effect(state, state.cx - value);
+                set_sub_flags(state, state.cx, value);
             }
             Register::DX => {
-                arithmetic_side_effect(state, state.dx - value);
+                set_sub_flags(state, state.dx, value);
             }
             Register::SP => {
-                arithmetic_side_effect(state, state.sp - value);
+                set_sub_flags(state, state.sp, value);
             }
             Register::BP => {
-                arithmetic_side_effect(state, state.bp - value);
+                set_sub_flags(state, state.bp, value);
             }
             Register::SI => {
-                arithmetic_side_effect(state, state.si - value);
+                set_sub_flags(state, state.si, value);
             }
             Register::DI => {
-                arithmetic_side_effect(state, state.di - value);
+                set_sub_flags(state, state.di, value);
             }
             _ => todo!(),
         },
